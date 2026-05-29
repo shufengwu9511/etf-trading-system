@@ -6,9 +6,9 @@ import json
 
 # ---- Tushare 数据源 ----
 try:
-    from secrets import TUSHARE_TOKEN
+    from local_secrets import TUSHARE_TOKEN
 except ImportError:
-    TUSHARE_TOKEN = None  # 用户需从 secrets.example.py 复制为 secrets.py 并填入真实Token
+    TUSHARE_TOKEN = None  # 用户需从 local_secrets.example.py 复制为 local_secrets.py 并填入真实Token
 
 # ---- 资金配置 (单位: 元) ----
 TOTAL_CAPITAL = 2_000_000          # 总资金 200万

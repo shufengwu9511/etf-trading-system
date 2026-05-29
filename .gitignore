@@ -4,7 +4,7 @@ __pycache__/
 *.egg-info/
 
 # 敏感配置 - 永不提交
-secrets.py
+local_secrets.py
 
 # 数据库
 data/*.db
