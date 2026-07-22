@@ -199,6 +199,7 @@ def run_sell(fund_code, args):
       python main.py sell <fund_code>              # 全部赎回
       python main.py sell <fund_code> --ratio 0.5  # 赎回50%
       python main.py sell <fund_code> --shares 5000 # 赎回5000份
+      python main.py sell <fund_code> --submit-date 20260618 --confirm-date 20260619  # 指定日期
     """
     print("=" * 60)
     print("  标记赎回")
@@ -207,15 +208,18 @@ def run_sell(fund_code, args):
 
     if not fund_code:
         print("  [ERROR] 请指定基金代码")
-        print("  用法: python main.py sell <fund_code> [--ratio N | --shares N]")
+        print("  用法: python main.py sell <fund_code> [--ratio N | --shares N] [--submit-date YYYYMMDD] [--confirm-date YYYYMMDD]")
         print("  示例: python main.py sell 110020              # 全部赎回")
         print("        python main.py sell 110020 --ratio 0.5  # 赎回50%")
         print("        python main.py sell 110020 --shares 5000 # 赎回5000份")
+        print("        python main.py sell 110020 --submit-date 20260618 --confirm-date 20260619")
         return
 
     # 解析参数
     ratio = None
     shares = None
+    submit_date = None
+    confirm_date = None
     i = 0
     while i < len(args):
         if args[i] == "--ratio" and i + 1 < len(args):
@@ -224,10 +228,16 @@ def run_sell(fund_code, args):
         elif args[i] == "--shares" and i + 1 < len(args):
             shares = float(args[i + 1])
             i += 2
+        elif args[i] == "--submit-date" and i + 1 < len(args):
+            submit_date = args[i + 1]
+            i += 2
+        elif args[i] == "--confirm-date" and i + 1 < len(args):
+            confirm_date = args[i + 1]
+            i += 2
         else:
             i += 1
 
-    sell_holding_partial(fund_code, ratio=ratio, shares=shares)
+    sell_holding_partial(fund_code, ratio=ratio, shares=shares, submit_date=submit_date, confirm_date=confirm_date)
 
 
 def run_update(fund_code, args):
@@ -514,6 +524,8 @@ if __name__ == "__main__":
             print("  python main.py buy <code> --amount N [--submit-date YYYYMMDD]   新增建仓(支持历史日期)")
             print("  python main.py confirm <code> --shares N --nav N [--confirm-date YYYYMMDD]  确认在途申购")
             print("  python main.py sell <code> [--ratio 0.5]          赎回(支持部分赎回)")
+            print("                                [--submit-date YYYYMMDD]")
+            print("                                [--confirm-date YYYYMMDD]")
             print("  python main.py update <code> [--shares N] [--cost_nav N]  更新持仓")
             print("                           [--add-shares N] [--add-amount N]  追加加仓")
             print("                           [--submit-date YYYYMMDD] [--confirm-date YYYYMMDD]  指定历史日期")

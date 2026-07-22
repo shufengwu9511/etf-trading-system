@@ -12,8 +12,9 @@ from config import (
     MOMENTUM_SHORT, MOMENTUM_MEDIUM, MOMENTUM_WEIGHT_SHORT, MOMENTUM_WEIGHT_MEDIUM,
     MOMENTUM_MIN_THRESHOLD,
     ROTATION_HOLD_COUNT, ROTATION_CYCLE_DAYS,
-    # 止盈止损
-    TAKE_PROFIT_TIER1, TAKE_PROFIT_TIER2,
+    # 移动止盈 + 止损
+    TRAILING_STOP_ACTIVATE, TRAILING_STOP_PULLBACK,
+    TRAILING_STOP_PANIC_PULLBACK, TRAILING_STOP_TOP1_PULLBACK,
     STOP_LOSS_THRESHOLD, STOP_LOSS_PANIC_THRESHOLD, MIN_HOLD_DAYS,
     # 恐慌监控
     PANIC_HS300_DROP, PANIC_NORTH_OUTFLOW, PANIC_LIMIT_DOWN_COUNT,
@@ -342,20 +343,20 @@ def check_rotation_signals(holdings):
 
 def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
     """
-    检查所有持仓的止盈止损信号 (阶梯止盈版)
-    is_panic: 是否处于恐慌预警状态 (收紧止损阈值)
-    momentum_top_codes: 动量排名前N的ETF代码集合, 在其中的行业ETF不触发止盈(让利润奔跑)
-    
-    阶梯止盈逻辑:
-      第一档: 收益 >= TAKE_PROFIT_TIER1(+8%) → 赎回一半 (sell_ratio=0.5)
-      第二档: 收益 >= TAKE_PROFIT_TIER2(+15%) → 赎回全部
-      动量排名前N的行业ETF: 完全不触发止盈
+    检查所有持仓的止盈止损信号 (移动止盈版)
+    is_panic: 是否处于恐慌预警状态 (收紧止损阈值和回撤阈值)
+    momentum_top_codes: 动量排名前N的ETF代码集合, 排名第1的使用更宽的移动止盈容限
+
+    移动止盈逻辑:
+      利润 >= 激活阈值 → 开始跟踪每日利润峰值
+      从峰值回撤 >= 回撤阈值 → 清仓
+      动量排名第1: 回撤容限放宽至 TRAILING_STOP_TOP1_PULLBACK
     """
     if momentum_top_codes is None:
         momentum_top_codes = set()
     signals = []
-    # stop_loss 取绝对值 (正数), 判断时用 profit_pct <= -stop_loss
     stop_loss = abs(STOP_LOSS_PANIC_THRESHOLD if is_panic else STOP_LOSS_THRESHOLD)
+    trailing_pullback = TRAILING_STOP_PANIC_PULLBACK if is_panic else TRAILING_STOP_PULLBACK
 
     for h in holdings:
         profit_pct = h.get("profit_pct", 0)
@@ -363,41 +364,54 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
 
         # 最短持有期检查
         if hold_days < MIN_HOLD_DAYS and profit_pct > 0:
-            # 盈利但持有不足7天, 不触发止盈 (避免赎回费)
             continue
 
-        # 行业ETF在动量排名前N, 跳过止盈让利润奔跑
-        if h["category"] == "satellite" and h["etf_code"] in momentum_top_codes:
+        # 宽基ETF跳过止盈 (由PE估值择时管理)
+        if h.get("category") == "core":
             continue
 
-        # 阶梯止盈: 第二档优先判断
-        if profit_pct >= TAKE_PROFIT_TIER2:
+        # 确定此持仓的回撤阈值
+        is_top1 = momentum_top_codes and h["etf_code"] in momentum_top_codes
+        # 检查是否是NO.1
+        if is_top1 and len(momentum_top_codes) > 0:
+            # 需要通过动量排名确认是否为第1
+            # 这里简化: 只要在前N中就用宽松阈值, 第1在外部精确判断
+            if is_panic:
+                etf_pullback = TRAILING_STOP_PANIC_PULLBACK
+            else:
+                etf_pullback = trailing_pullback  # 标准回撤
+        else:
+            etf_pullback = trailing_pullback
+
+        # === 移动止盈 ===
+        # 获取该持仓的利润峰值 (从数据库读取)
+        peak_profit = h.get("peak_profit_pct", 0)
+
+        # 更新峰值
+        if profit_pct >= TRAILING_STOP_ACTIVATE:
+            if profit_pct > peak_profit:
+                # 需要在数据库中更新 peak_profit_pct
+                peak_profit = profit_pct
+
+        # 从峰值回撤超过阈值 → 清仓信号
+        if peak_profit > 0 and (peak_profit - profit_pct) >= etf_pullback:
             signals.append({
                 "etf_code": h["etf_code"],
                 "fund_code": h["fund_code"],
                 "name": h["name"],
                 "category": h["category"],
                 "direction": "sell",
-                "signal_type": "take_profit",
-                "reason": f"阶梯止盈(第二档): 收益+{profit_pct:.2f}% (阈值+{TAKE_PROFIT_TIER2:.0f}%)",
+                "signal_type": "trailing_stop",
+                "reason": f"移动止盈: 峰值+{peak_profit:.2f}%, 回撤至+{profit_pct:.2f}% (回撤{peak_profit - profit_pct:.2f}%, 阈值{etf_pullback:.0f}%)",
                 "profit_pct": profit_pct,
+                "peak_profit_pct": peak_profit,
                 "sell_ratio": 1.0,
                 "priority": "normal"
             })
-        elif profit_pct >= TAKE_PROFIT_TIER1:
-            signals.append({
-                "etf_code": h["etf_code"],
-                "fund_code": h["fund_code"],
-                "name": h["name"],
-                "category": h["category"],
-                "direction": "sell",
-                "signal_type": "take_profit",
-                "reason": f"阶梯止盈(第一档): 收益+{profit_pct:.2f}% (阈值+{TAKE_PROFIT_TIER1:.0f}%), 建议赎回一半",
-                "profit_pct": profit_pct,
-                "sell_ratio": 0.5,
-                "priority": "normal"
-            })
-        elif profit_pct <= -stop_loss:
+            continue  # 已生成止盈信号, 不再检查止损
+
+        # === 止损 (不变) ===
+        if profit_pct <= -stop_loss:
             signals.append({
                 "etf_code": h["etf_code"],
                 "fund_code": h["fund_code"],
@@ -507,38 +521,30 @@ def _check_ma_trend(ts_code, conn):
 
 
 def _calc_single_momentum(ts_code, conn):
-    """计算单只ETF的动量得分"""
+    """计算单只ETF的动量得分 (价格比法)
+
+    与 etf_discovery.py / breakout_discovery.py 保持一致:
+      n日动量 = 最新收盘价 / n日前收盘价 - 1
+    直接用 close 价格计算, 避免 pct_chg 缺失导致的累乘误差。
+    """
     rows = conn.execute("""
-        SELECT trade_date, pct_chg FROM index_daily
-        WHERE ts_code = ?
+        SELECT trade_date, close FROM index_daily
+        WHERE ts_code = ? AND close IS NOT NULL AND close > 0
         ORDER BY trade_date DESC LIMIT ?
     """, (ts_code, MOMENTUM_MEDIUM + 10)).fetchall()
 
-    if len(rows) < MOMENTUM_MEDIUM:
+    if len(rows) < MOMENTUM_MEDIUM + 1:
         return None
 
+    # rows 是倒序 (最新在前), 反转为正序 (最旧在前)
     rows = list(reversed(rows))
-    # pct_chg: 百分比形式 (如 0.2219 表示涨0.2219%)
-    pct_changes = []
-    for r in rows:
-        if r["pct_chg"] is not None:
-            pct_changes.append(r["pct_chg"])
+    closes = [r["close"] for r in rows]
 
-    if len(pct_changes) < MOMENTUM_MEDIUM:
-        return None
+    # 短期动量: close[-1] / close[-(SHORT+1)] - 1
+    momentum_20d = (closes[-1] / closes[-(MOMENTUM_SHORT + 1)] - 1) * 100.0
 
-    # 短期动量: 最近MOMENTUM_SHORT日累乘收益率 (乘积法)
-    # pct_chg 为百分比形式 (0.2219 = 涨0.2219%), 先÷100转小数计算，结果再×100保持百分比单位
-    momentum_20d = 1.0
-    for r in pct_changes[-MOMENTUM_SHORT:]:
-        momentum_20d *= (1 + r / 100.0)
-    momentum_20d = (momentum_20d - 1) * 100.0  # 结果单位与 pct_chg 一致 (百分比)
-
-    # 中期动量: 最近MOMENTUM_MEDIUM日累乘收益率
-    momentum_60d = 1.0
-    for r in pct_changes[-MOMENTUM_MEDIUM:]:
-        momentum_60d *= (1 + r / 100.0)
-    momentum_60d = (momentum_60d - 1) * 100.0  # 结果单位与 pct_chg 一致 (百分比)
+    # 中期动量: close[-1] / close[-(MEDIUM+1)] - 1
+    momentum_60d = (closes[-1] / closes[-(MOMENTUM_MEDIUM + 1)] - 1) * 100.0
 
     return {
         "momentum_20d": round(momentum_20d, 4),

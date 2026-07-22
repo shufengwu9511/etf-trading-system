@@ -72,14 +72,21 @@ MOMENTUM_MIN_THRESHOLD = 0              # 动量最低门槛: 综合得分<=0的
 ROTATION_HOLD_COUNT = 3                 # 同时持有的行业ETF数量
 ROTATION_CYCLE_DAYS = 14                # 轮动周期 (天)
 
-# 止盈止损
-# 止盈止损 (基于持仓成本价与当前净值的涨跌幅, 使用百分比数值)
-TAKE_PROFIT_THRESHOLD = 5.0             # 止盈 +5% (旧阈值, 保留作为第一档参考)
-TAKE_PROFIT_TIER1 = 8.0                 # 阶梯止盈第一档: +8% 卖出一半
-TAKE_PROFIT_TIER2 = 15.0                # 阶梯止盈第二档: +15% 清仓
+# 移动止盈 + 止损
+# 移动止盈: 利润超过激活阈值后跟踪峰值, 从峰值回撤超过阈值则清仓
+TRAILING_STOP_ACTIVATE = 6.0            # 激活阈值: 利润≥+6%开始跟踪峰值
+TRAILING_STOP_PULLBACK = 4.0            # 回撤阈值: 从峰值回撤4%触发清仓
+TRAILING_STOP_PANIC_PULLBACK = 3.0      # 恐慌模式回撤收紧至3%
+TRAILING_STOP_TOP1_PULLBACK = 6.0       # 动量排名第1的容限6% (让最强趋势多跑)
+# 止损 (不变)
 STOP_LOSS_THRESHOLD = -15.0             # 止损 -15%
 STOP_LOSS_PANIC_THRESHOLD = -8.0        # 恐慌预警时收紧止损至 -8%
 MIN_HOLD_DAYS = 7                       # 最短持有天数 (按份额确认日算自然日, 避免赎回费)
+
+# 保留旧参数以兼容 (已弃用, 仅用于向后兼容)
+TAKE_PROFIT_THRESHOLD = 5.0
+TAKE_PROFIT_TIER1 = 8.0
+TAKE_PROFIT_TIER2 = 15.0
 
 # 恐慌指数监控
 # index_daily pct_chg: 百分比形式 (如 -2.5 表示跌2.5%)

@@ -4,6 +4,7 @@
 # ============================================================
 import json
 import os
+import sqlite3
 from datetime import datetime, timedelta
 from db import get_connection
 from config import (
@@ -15,6 +16,8 @@ from config import (
     MOMENTUM_SHORT, MOMENTUM_MEDIUM,
     MOMENTUM_WEIGHT_SHORT, MOMENTUM_WEIGHT_MEDIUM,
 )
+from etf_discovery import discover_candidates
+from breakout_discovery import discover_breakout_candidates
 
 
 def collect_dashboard_data():
@@ -47,6 +50,35 @@ def collect_dashboard_data():
         if data["total_cost"] > 0 else 0
     )
     data["available_cash"] = TOTAL_CAPITAL - data["total_market_value"]
+
+    # ---- 1b. 所有ETF近30日K线数据 (用于所有基金名称悬浮提示) ----
+    # 收集所有需要K线的ETF代码 (去重), 按 etf_code (如 510310.SH) 索引
+    all_kline_etfs = set()
+    # 构建 fund_code → etf_code 映射
+    fund2etf = {}
+    all_config_etfs = CORE_ETFS + SATELLITE_ETFS
+    for e in all_config_etfs:
+        all_kline_etfs.add(e["code"])
+        fc = e.get("fund_code", "")
+        if fc:
+            fund2etf[fc] = e["code"]
+
+    kline_data = {}
+    for etf_code in all_kline_etfs:
+        rows = conn.execute("""
+            SELECT trade_date, open, close, high, low, vol
+            FROM index_daily
+            WHERE ts_code = ?
+            ORDER BY trade_date ASC
+        """, (etf_code,)).fetchall()
+        if rows:
+            kline_data[etf_code] = [
+                {"d": r["trade_date"], "o": r["open"], "c": r["close"],
+                 "h": r["high"], "l": r["low"], "v": r["vol"]}
+                for r in rows
+            ]
+    data["holdings_kline"] = kline_data
+    data["fund2etf"] = fund2etf
 
     # 分组
     data["core_holdings"] = [h for h in holdings if h["category"] == "core"]
@@ -199,6 +231,55 @@ def collect_dashboard_data():
     data["recent_logs"] = [dict(r) for r in log_rows]
 
     conn.close()
+
+    # ---- 7.5. ETF动量发现 ----
+    print("  扫描动量候选ETF...")
+    try:
+        data["etf_candidates"] = discover_candidates(momentum_threshold=0.05, top_n=10)
+    except Exception as e:
+        print(f"  [WARN] ETF候选发现失败: {e}")
+        data["etf_candidates"] = []
+    
+    # ---- 7.6. ETF箱体突破发现 ----
+    print("  扫描箱体突破ETF...")
+    try:
+        data["breakout_candidates"] = discover_breakout_candidates(direction="up", top_n=10)
+    except Exception as e:
+        print(f"  [WARN] 箱体突破发现失败: {e}")
+        data["breakout_candidates"] = []
+    
+    # ---- 7.7. 补充发现/突破候选ETF的K线数据 (来自 etf_cache.db) ----
+    _etf_cache_path = os.path.join(os.path.dirname(__file__), "data", "tdx_cache", "etf_cache.db")
+    if os.path.exists(_etf_cache_path):
+        _cache_conn = sqlite3.connect(_etf_cache_path)
+        _cache_conn.row_factory = sqlite3.Row
+        
+        # 收集所有需要K线的候选ETF代码 (6位数字, 无后缀)
+        _candidate_codes = set()
+        for c in data.get("etf_candidates", []):
+            _candidate_codes.add(c["code"])
+        for c in data.get("breakout_candidates", []):
+            _candidate_codes.add(c["code"])
+        
+        if _candidate_codes:
+            _placeholders = ",".join("?" for _ in _candidate_codes)
+            _rows = _cache_conn.execute(
+                f"SELECT code, date, open, close, high, low, volume FROM kline_data "
+                f"WHERE code IN ({_placeholders}) ORDER BY code, date",
+                list(_candidate_codes)
+            ).fetchall()
+            
+            for r in _rows:
+                code = r["code"]
+                if code not in kline_data:
+                    kline_data[code] = []
+                kline_data[code].append({
+                    "d": r["date"], "o": r["open"], "c": r["close"],
+                    "h": r["high"], "l": r["low"], "v": r["volume"]
+                })
+        
+        _cache_conn.close()
+    data["holdings_kline"] = kline_data
     
     # ---- 8. 实时行情数据 ----
     realtime = get_realtime_quotes()
@@ -214,11 +295,11 @@ def collect_dashboard_data():
             quote = realtime["quotes"].get(code, {})
             if quote:
                 pct = quote.get('pct_chg', 0)
-                pct_color = "#ef4444" if pct < 0 else "#22c55e"
+                pct_color = "#22c55e" if pct < 0 else "#ef4444"
                 pct_sign = "+" if pct >= 0 else ""
                 realtime_table += f'''
                 <tr>
-                    <td style="padding:6px 12px;font-weight:500">{etf['name']}</td>
+                    <td style="padding:6px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{etf['code']}">{etf['name']}</td>
                     <td style="padding:6px 12px;text-align:right">{quote.get('price', '--')}</td>
                     <td style="padding:6px 12px;text-align:right;color:{pct_color};font-weight:600">{pct_sign}{pct:.2f}%</td>
                 </tr>'''
@@ -354,7 +435,7 @@ def _render_action(action, panic):
             amount = sig.get("amount", 0) or sig.get("target_amount", 0)
             stop_rows += f'''
             <tr>
-                <td style="padding:8px 12px">{icon} {sig.get("name","")}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">{icon} {sig.get("name","")}</td>
                 <td style="padding:8px 12px;color:#6b7280">{sig.get("fund_code","")}</td>
                 <td style="padding:8px 12px">{_fmt_money(amount)}</td>
                 <td style="padding:8px 12px;font-size:12px">{sig.get("reason","")}</td>
@@ -377,7 +458,7 @@ def _render_action(action, panic):
             amount = sig.get("amount", 0) or sig.get("target_amount", 0)
             core_rows += f'''
             <tr>
-                <td style="padding:8px 12px">{dir_icon} {sig.get("name","")}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">{dir_icon} {sig.get("name","")}</td>
                 <td style="padding:8px 12px;color:#6b7280">{sig.get("fund_code","")}</td>
                 <td style="padding:8px 12px">{_fmt_money(amount)}</td>
                 <td style="padding:8px 12px;font-size:12px">{sig.get("reason","")}</td>
@@ -401,7 +482,7 @@ def _render_action(action, panic):
             amount = sig.get("amount", 0) or sig.get("target_amount", 0)
             buy_rows += f'''
             <tr>
-                <td style="padding:8px 12px">🟢 {sig.get("name","")}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">🟢 {sig.get("name","")}</td>
                 <td style="padding:8px 12px;color:#6b7280">{sig.get("fund_code","")}</td>
                 <td style="padding:8px 12px">{_fmt_money(amount)}</td>
                 <td style="padding:8px 12px;font-size:12px">{sig.get("reason","")}</td>
@@ -412,7 +493,7 @@ def _render_action(action, panic):
             amount = sig.get("amount", 0) or sig.get("target_amount", 0)
             sell_rows += f'''
             <tr>
-                <td style="padding:8px 12px">🔴 {sig.get("name","")}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">🔴 {sig.get("name","")}</td>
                 <td style="padding:8px 12px;color:#6b7280">{sig.get("fund_code","")}</td>
                 <td style="padding:8px 12px">{_fmt_money(amount)}</td>
                 <td style="padding:8px 12px;font-size:12px">{sig.get("reason","")}</td>
@@ -441,6 +522,149 @@ def _fmt_pct(val):
     return f"{val:+.2f}%"
 
 
+def _render_etf_candidates(candidates):
+    """渲染ETF动量发现候选表"""
+    if not candidates:
+        return '''<div class="section-full">
+    <div class="card">
+        <h3 style="margin-bottom:12px;font-size:16px;color:#374151">🔍 ETF动量发现</h3>
+        <div style="padding:20px;text-align:center;color:#9ca3af">
+            暂无符合条件的候选ETF<br>
+            <span style="font-size:12px">(数据来自通达信全市场ETF缓存 data/tdx_cache/etf_cache.db)</span>
+        </div>
+    </div>
+</div>'''
+
+    rows = ""
+    for i, c in enumerate(candidates, 1):
+        score_color = "#ef4444" if c["score"] >= 0 else "#22c55e"
+        m10_color = "#ef4444" if c["m10"] >= 0 else "#22c55e"
+        m30_color = "#ef4444" if c["m30"] >= 0 else "#22c55e"
+        vol_str = f"{c['avg_vol']/10000:.0f}万"
+        rows += f'''
+            <tr>
+                <td style="padding:8px 12px;text-align:center;font-weight:600;color:#6b7280">{i}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{c['code']}">{c['name']}</td>
+                <td style="padding:8px 12px;color:#6b7280;font-family:monospace">{c['code']}</td>
+                <td style="padding:8px 12px;text-align:right;font-weight:600;color:{m10_color}">{_fmt_pct(c['m10'])}</td>
+                <td style="padding:8px 12px;text-align:right;font-weight:600;color:{m30_color}">{_fmt_pct(c['m30'])}</td>
+                <td style="padding:8px 12px;text-align:right;font-weight:700;color:{score_color}">{_fmt_pct(c['score'])}</td>
+                <td style="padding:8px 12px;text-align:right;color:#6b7280">{vol_str}</td>
+                <td style="padding:8px 12px;color:#6b7280;font-size:12px">{c['klines']}条</td>
+            </tr>'''
+
+    return f'''<div class="section-full">
+    <div class="card" style="border:2px solid #e5e7eb">
+        <h3 style="margin-bottom:8px;font-size:16px;color:#374151">
+            🔍 ETF动量发现
+            <span style="font-size:12px;color:#9ca3af;font-weight:400;margin-left:8px">未在候选池中的高动量ETF</span>
+        </h3>
+        <div style="font-size:12px;color:#9ca3af;margin-bottom:12px">
+            动量≥5% | 日均成交≥500万 | 排除债券/货币/海外ETF | 数据来自通达信缓存
+        </div>
+        <div class="section">
+            <div style="overflow-x:auto">
+                <table style="width:100%;border-collapse:collapse;font-size:14px">
+                    <thead>
+                        <tr style="background:#f9fafb;border-bottom:2px solid #e5e7eb">
+                            <th style="padding:10px 12px;text-align:center;font-weight:600;color:#6b7280;width:40px">#</th>
+                            <th style="padding:10px 12px;text-align:left;font-weight:600;color:#6b7280">名称</th>
+                            <th style="padding:10px 12px;text-align:left;font-weight:600;color:#6b7280">代码</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">10日动量</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">30日动量</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">综合得分</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">日均成交</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">K线</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+            <div style="position:relative;height:240px;min-width:300px">
+                <canvas id="discoveryChart"></canvas>
+            </div>
+        </div>
+        <div style="margin-top:16px;padding:12px 16px;background:#eff6ff;border-radius:8px;border-left:4px solid #3b82f6;font-size:13px;color:#1e40af">
+            <span style="font-weight:600">💡 提示：</span>
+            发现感兴趣的ETF？使用命令添加到候选池：<br>
+            <code style="background:#dbeafe;padding:2px 8px;border-radius:4px;font-size:12px">python main.py add-etf --fund-code &lt;联接基金代码&gt; --name "名称" --etf-code &lt;ETF代码&gt;</code>
+            <br><span style="font-size:11px;color:#6b7280">（联接基金代码请到天天基金/易方达APP查询确认）</span>
+        </div>
+    </div>
+</div>'''
+
+
+def _render_breakout_candidates(candidates):
+    """渲染ETF箱体突破候选表"""
+    if not candidates:
+        return '''<div class="section-full">
+    <div class="card">
+        <h3 style="margin-bottom:12px;font-size:16px;color:#374151">📈 ETF箱体突破发现</h3>
+        <div style="padding:20px;text-align:center;color:#9ca3af">
+            暂无向上突破的ETF<br>
+            <span style="font-size:12px">(布林带 20日 ±2σ，数据来自通达信全市场ETF缓存)</span>
+        </div>
+    </div>
+</div>'''
+
+    rows = ""
+    for i, c in enumerate(candidates, 1):
+        dev_color = "#ef4444" if c["pct_deviation"] >= 0 else "#22c55e"
+        vol_color = "#ef4444" if c["vol_ratio"] >= 1.5 else ("#f59e0b" if c["vol_ratio"] >= 1.0 else "#6b7280")
+        vol_str = f"{c['avg_vol']/10000:.0f}万"
+        rows += f'''
+            <tr>
+                <td style="padding:8px 12px;text-align:center;font-weight:600;color:#6b7280">{i}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{c['code']}">{c['name']}</td>
+                <td style="padding:8px 12px;color:#6b7280;font-family:monospace">{c['code']}</td>
+                <td style="padding:8px 12px;text-align:right;font-family:monospace">{c['close']:.4f}</td>
+                <td style="padding:8px 12px;text-align:right;font-weight:700;color:{dev_color}">{_fmt_pct(c['pct_deviation'])}</td>
+                <td style="padding:8px 12px;text-align:right;font-weight:600;color:{vol_color}">{c['vol_ratio']:.2f}x</td>
+                <td style="padding:8px 12px;text-align:right;color:#6b7280">{c['band_width']:.2f}%</td>
+                <td style="padding:8px 12px;text-align:right;color:#6b7280">{vol_str}</td>
+            </tr>'''
+
+    return f'''<div class="section-full">
+    <div class="card" style="border:2px solid #e5e7eb">
+        <h3 style="margin-bottom:8px;font-size:16px;color:#374151">
+            📈 ETF箱体突破发现
+            <span style="font-size:12px;color:#9ca3af;font-weight:400;margin-left:8px">布林带向上突破的ETF候选</span>
+        </h3>
+        <div style="font-size:12px;color:#9ca3af;margin-bottom:12px">
+            布林带 20日 ±2σ | 收盘价突破上轨 | 日均成交≥500万 | 排除债券/货币/海外 | 按偏离度排序
+        </div>
+        <div class="section">
+            <div style="overflow-x:auto">
+                <table style="width:100%;border-collapse:collapse;font-size:14px">
+                    <thead>
+                        <tr style="background:#f9fafb;border-bottom:2px solid #e5e7eb">
+                            <th style="padding:10px 12px;text-align:center;font-weight:600;color:#6b7280;width:40px">#</th>
+                            <th style="padding:10px 12px;text-align:left;font-weight:600;color:#6b7280">名称</th>
+                            <th style="padding:10px 12px;text-align:left;font-weight:600;color:#6b7280">代码</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">收盘价</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">偏离中轨</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">量比</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">带宽</th>
+                            <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">日均成交</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+            <div style="position:relative;height:240px;min-width:300px">
+                <canvas id="breakoutChart"></canvas>
+            </div>
+        </div>
+        <div style="margin-top:16px;padding:12px 16px;background:#fef3c7;border-radius:8px;border-left:4px solid #f59e0b;font-size:13px;color:#92400e">
+            <span style="font-weight:600">💡 策略说明：</span>
+            箱体突破是技术分析中的趋势信号。收盘价突破布林带上轨，意味着价格打破近期盘整区间，可能开启上涨趋势。
+            量比&gt;1.5表示放量突破，信号更强。带宽反映波动率，较窄的带宽突破更具参考价值。<br>
+            <span style="font-size:11px;color:#6b7280">发现感兴趣的ETF？同样使用 add-etf 命令添加到候选池</span>
+        </div>
+    </div>
+</div>'''
+
+
 def generate_html(data):
     """生成 HTML 看板"""
     d = data
@@ -462,7 +686,7 @@ def generate_html(data):
     panic_icon = "🚨" if is_panic else ("⚠️" if is_warning else "✅")
 
     # 总盈亏颜色
-    pl_color = "#ef4444" if d["total_profit_loss"] < 0 else "#22c55e"
+    pl_color = "#22c55e" if d["total_profit_loss"] < 0 else "#ef4444"
 
     # 饼图数据
     pie_labels = json.dumps(list(d["pie_data"].keys()))
@@ -475,7 +699,7 @@ def generate_html(data):
     mom_fund_codes = json.dumps([m.get("fund_code", "") for m in d["momentum"]])
     mom_companies = json.dumps([m.get("company", "") for m in d["momentum"]])
     mom_colors = json.dumps([
-        "#22c55e" if m.get("composite_score", 0) >= 0 else "#ef4444"
+        "#ef4444" if m.get("composite_score", 0) >= 0 else "#22c55e"
         for m in d["momentum"]
     ])
     
@@ -486,7 +710,7 @@ def generate_html(data):
     rt_mom_fund_codes = json.dumps([m.get("fund_code", "") for m in rt_mom]) if rt_mom else "[]"
     rt_mom_companies = json.dumps([m.get("company", "") for m in rt_mom]) if rt_mom else "[]"
     rt_mom_colors = json.dumps([
-        "#22c55e" if m.get("pct_chg", 0) >= 0 else "#ef4444"
+        "#ef4444" if m.get("pct_chg", 0) >= 0 else "#22c55e"
         for m in rt_mom
     ]) if rt_mom else "[]"
     
@@ -502,7 +726,7 @@ def generate_html(data):
             pe_html = f'''
         <div style="flex:1;min-width:200px;background:#f9fafb;border-radius:8px;padding:16px;border:1px dashed #d1d5db">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                <span style="font-weight:600">{p['name']}</span>
+                <span style="font-weight:600;cursor:pointer" class="fund-name" data-fund-code="{p['code']}">{p['name']}</span>
                 <span>📊</span>
             </div>
             <div style="font-size:20px;font-weight:700;color:#9ca3af;margin-bottom:4px">N/A</div>
@@ -522,7 +746,7 @@ def generate_html(data):
         pe_items += f'''
         <div style="flex:1;min-width:200px;background:#fff;border-radius:8px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                <span style="font-weight:600">{p['name']}</span>
+                <span style="font-weight:600;cursor:pointer" class="fund-name" data-fund-code="{p['code']}">{p['name']}</span>
                 <span>{ma_icon}</span>
             </div>
             <div style="font-size:24px;font-weight:700;color:{pct_color};margin-bottom:4px">{pe_text}</div>
@@ -537,16 +761,17 @@ def generate_html(data):
             return ""
         rows_html = ""
         for h in items:
-            pl_cls = "#ef4444" if h["profit_pct"] < 0 else "#22c55e"
+            pl_cls = "#22c55e" if h["profit_pct"] < 0 else "#ef4444"
             rows_html += f'''
             <tr>
-                <td style="padding:10px 12px;font-weight:500">{h['name']}</td>
+                <td style="padding:10px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{h['etf_code']}">{h['name']}</td>
                 <td style="padding:10px 12px;color:#6b7280">{h['fund_code']}</td>
                 <td style="padding:10px 12px;text-align:right">{h['shares']:,.2f}</td>
                 <td style="padding:10px 12px;text-align:right">{h['cost_nav']:.4f}</td>
                 <td style="padding:10px 12px;text-align:right">{h['current_nav']:.4f}<br><span style="font-size:11px;color:#9ca3af">{h.get('nav_date','')}</span></td>
                 <td style="padding:10px 12px;text-align:right;font-weight:600">{_fmt_money(h['market_value'])}</td>
                 <td style="padding:10px 12px;text-align:right;font-weight:700;color:{pl_cls}">{_fmt_pct(h['profit_pct'])}</td>
+                <td style="padding:10px 12px;text-align:right;font-weight:600;color:{pl_cls}">{_fmt_money(h['profit_loss'])}</td>
                 <td style="padding:10px 12px;text-align:right;color:#6b7280">{h.get('hold_days', 0)}天</td>
             </tr>'''
         return f'''
@@ -563,6 +788,7 @@ def generate_html(data):
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">当前净值(日期)</th>
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">市值</th>
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">盈亏%</th>
+                        <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">盈利金额</th>
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">持有天数</th>
                     </tr>
                 </thead>
@@ -601,14 +827,35 @@ def generate_html(data):
             <td style="padding:8px 12px;color:#6b7280;font-size:12px">{t.get('remark','')}</td>
         </tr>'''
 
+    # ETF候选发现
+    etf_candidates_html = _render_etf_candidates(d.get("etf_candidates", []))
+
+    # ETF发现图表数据
+    disc_labels = json.dumps([c["name"] for c in d.get("etf_candidates", [])])
+    disc_codes = json.dumps([c["code"] for c in d.get("etf_candidates", [])])
+    disc_scores = json.dumps([c["score"] for c in d.get("etf_candidates", [])])
+    disc_colors = json.dumps([
+        "#ef4444" if c["score"] >= 0 else "#22c55e"
+        for c in d.get("etf_candidates", [])
+    ])
+
+    # ETF箱体突破
+    breakout_html = _render_breakout_candidates(d.get("breakout_candidates", []))
+
+    # 箱体突破图表数据
+    brk_labels = json.dumps([c["name"] for c in d.get("breakout_candidates", [])])
+    brk_codes = json.dumps([c["code"] for c in d.get("breakout_candidates", [])])
+    brk_devs = json.dumps([c["pct_deviation"] for c in d.get("breakout_candidates", [])])
+    brk_vols = json.dumps([c["vol_ratio"] for c in d.get("breakout_candidates", [])])
+
     # 恐慌指标详情
     hs300_pct = panic.get("hs300_pct_chg")
     hs300_display = f"{hs300_pct:.2f}%" if hs300_pct is not None else "--"
-    hs300_color = "#ef4444" if (hs300_pct is not None and hs300_pct < 0) else "#22c55e"
+    hs300_color = "#22c55e" if (hs300_pct is not None and hs300_pct < 0) else "#ef4444"
 
     north = panic.get("north_money")
     north_display = f"{north/10000:.1f}亿" if north is not None else "--"
-    north_color = "#ef4444" if (north is not None and north < 0) else "#22c55e"
+    north_color = "#22c55e" if (north is not None and north < 0) else "#ef4444"
 
     vol_ratio = panic.get("volume_ratio")
     vol_display = f"{vol_ratio:.1f}x" if vol_ratio is not None else "--"
@@ -621,6 +868,143 @@ def generate_html(data):
     # 恐慌指标日期
     panic_trade_date = panic.get("trade_date", "")
     panic_date_fmt = f"{panic_trade_date[:4]}-{panic_trade_date[4:6]}-{panic_trade_date[6:8]}" if panic_trade_date else ""
+
+    # K线悬浮提示 JavaScript (独立变量, 避免f-string转义)
+    kline_js = '''<script>
+(function() {
+    var kdata = window._klineData || {};
+    var tooltip = document.createElement('div');
+    tooltip.className = 'kline-tooltip';
+    tooltip.innerHTML = '<canvas id="klineCanvas" width="300" height="160"></canvas>';
+    document.body.appendChild(tooltip);
+    var canvas = tooltip.querySelector('canvas');
+    var ctx = canvas.getContext('2d');
+
+    function renderKline(fundCode) {
+        var rows = kdata[fundCode];
+        if (!rows || rows.length < 5) { tooltip.style.display = 'none'; return; }
+        var data = rows.slice(-30);
+        var n = data.length;
+        var w = canvas.width, h = canvas.height;
+        var pad = {top:28, right:52, bottom:26, left:8};
+        var pw = w - pad.left - pad.right;
+        var ph = h - pad.top - pad.bottom;
+        var barW = Math.max(2, Math.floor(pw / n * 0.7));
+        var gap = Math.floor(pw / n) - barW;
+        var maxH = -Infinity, minL = Infinity;
+        for (var i = 0; i < n; i++) {
+            if (data[i].h > maxH) maxH = data[i].h;
+            if (data[i].l < minL) minL = data[i].l;
+        }
+        var range = maxH - minL || 0.01;
+        var xScale = function(i) { return pad.left + i * (barW + gap) + gap/2; };
+        var yScale = function(price) { return pad.top + (maxH - price) / range * ph; };
+
+        // 先构建标题和canvas HTML, 替换后再画图
+        var first = data[0], last = data[n-1];
+        var chgPct = ((last.c - first.c) / first.c * 100).toFixed(2);
+        var chgCls = parseFloat(chgPct) >= 0 ? '#ef4444' : '#22c55e';
+        var volTotal = 0;
+        for (var i = 0; i < n; i++) volTotal += data[i].v;
+        var avgVol = (volTotal / n / 10000).toFixed(0);
+        var titleHtml = '<div class="kline-title">' + fundCode + ' 近30日K线</div>' +
+            '<div class="kline-stats">' +
+            '<span>区间涨跌: <b style="color:' + chgCls + '">' + (parseFloat(chgPct) >= 0 ? '+' : '') + chgPct + '%</b></span>' +
+            '<span>最高: ' + maxH.toFixed(3) + '</span>' +
+            '<span>最低: ' + minL.toFixed(3) + '</span>' +
+            '<span>日均量: ' + avgVol + '万手</span>' +
+            '</div>';
+        tooltip.innerHTML = titleHtml + '<canvas id="klineCanvas" width="300" height="160"></canvas>';
+        canvas = tooltip.querySelector('canvas');
+        ctx = canvas.getContext('2d');
+
+        // ---- 在新建的canvas上画K线 ----
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = '#fafbfc';
+        ctx.fillRect(pad.left, pad.top, pw, ph);
+        ctx.strokeStyle = '#e5e7eb';
+        ctx.lineWidth = 0.5;
+        for (var g = 0; g <= 4; g++) {
+            var gy = pad.top + g * ph / 4;
+            ctx.beginPath();
+            ctx.moveTo(pad.left, gy);
+            ctx.lineTo(pad.left + pw, gy);
+            ctx.stroke();
+            ctx.fillStyle = '#9ca3af';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'right';
+            var price = maxH - g * range / 4;
+            ctx.fillText(price.toFixed(2), w - 4, gy + 3);
+        }
+        for (var i = 0; i < n; i++) {
+            var d = data[i];
+            var x = xScale(i);
+            var yOpen = yScale(d.o), yClose = yScale(d.c);
+            var yHigh = yScale(d.h), yLow = yScale(d.l);
+            var isUp = d.c >= d.o;
+            ctx.strokeStyle = isUp ? '#ef4444' : '#22c55e';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(x + barW/2, yHigh);
+            ctx.lineTo(x + barW/2, yLow);
+            ctx.stroke();
+            var bodyTop = Math.min(yOpen, yClose);
+            var bodyH = Math.max(1, Math.abs(yClose - yOpen));
+            ctx.fillStyle = isUp ? '#ef4444' : '#22c55e';
+            ctx.fillRect(x, bodyTop, barW, bodyH);
+        }
+        ctx.strokeStyle = '#3b82f6';
+        ctx.lineWidth = 1.2;
+        ctx.setLineDash([3, 2]);
+        ctx.beginPath();
+        var started = false;
+        for (var i = 4; i < n; i++) {
+            var sum = 0;
+            for (var j = i-4; j <= i; j++) sum += data[j].c;
+            var ma = sum / 5;
+            var mx = xScale(i) + barW/2, my = yScale(ma);
+            if (!started) { ctx.moveTo(mx, my); started = true; }
+            else ctx.lineTo(mx, my);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#9ca3af';
+        ctx.font = '8px sans-serif';
+        ctx.textAlign = 'center';
+        for (var i = 0; i < n; i += Math.max(1, Math.floor(n/5))) {
+            var dateStr = data[i].d;
+            var label = dateStr.length === 8 ? dateStr.slice(4,6) + '/' + dateStr.slice(6,8) : dateStr.slice(-5);
+            ctx.fillText(label, xScale(i) + barW/2, h - 6);
+        }
+    }
+
+    document.addEventListener('mouseover', function(e) {
+        var target = e.target;
+        if (!target.classList.contains('fund-name')) return;
+        var code = target.getAttribute('data-fund-code');
+        if (!code) return;
+        renderKline(code);
+        if (kdata[code] && kdata[code].length >= 5) {
+            tooltip.style.display = 'block';
+        }
+    });
+
+    document.addEventListener('mousemove', function(e) {
+        if (tooltip.style.display !== 'block') return;
+        var x = e.clientX + 16, y = e.clientY - 10;
+        if (x + 330 > window.innerWidth) x = e.clientX - 340;
+        if (y + 210 > window.innerHeight) y = e.clientY - 220;
+        tooltip.style.left = x + 'px';
+        tooltip.style.top = y + 'px';
+    });
+
+    document.addEventListener('mouseout', function(e) {
+        if (e.target.classList.contains('fund-name') || e.target.closest('.fund-name')) {
+            tooltip.style.display = 'none';
+        }
+    });
+})();
+</script>'''
 
     html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -665,6 +1049,18 @@ def generate_html(data):
     .badge-hold {{ background:#f3f4f6; color:#374151; }}
     .badge-reduce {{ background:#fef3c7; color:#92400e; }}
     .footer {{ text-align:center; padding:16px; color:#9ca3af; font-size:12px; }}
+    /* K线悬浮提示 */
+    .fund-name {{ position:relative; }}
+    .fund-name:hover {{ background:#eff6ff; border-radius:4px; }}
+    .kline-tooltip {{
+        display:none; position:fixed; z-index:9999;
+        background:#fff; border-radius:10px; box-shadow:0 8px 30px rgba(0,0,0,0.18);
+        padding:12px; min-width:320px; pointer-events:none;
+    }}
+    .kline-tooltip .kline-title {{ font-size:13px; font-weight:700; color:#1f2937; margin-bottom:4px; text-align:left; }}
+    .kline-tooltip .kline-stats {{ font-size:11px; color:#6b7280; margin-bottom:6px; display:flex; gap:16px; }}
+    .kline-tooltip canvas {{ display:block; }}
+
 </style>
 </head>
 <body>
@@ -821,14 +1217,14 @@ def generate_html(data):
             <div style="margin-bottom:12px">
                 <div style="font-weight:600;color:#1f2937;margin-bottom:4px">① 短期动量（10日）</div>
                 <div style="font-family:monospace;background:#fff;padding:8px 12px;border-radius:6px;color:#1d4ed8">
-                    M₁ = [(1+r₁/100)×(1+r₂/100)×...×(1+rₙ/100) − 1] × 100， n = 10
+                    M₁ = (close<sub>今日</sub> / close<sub>10日前</sub> − 1) × 100
                 </div>
-                <div style="font-size:12px;color:#6b7280;margin-top:4px">其中 rᵢ = 第 i 日涨跌幅（%），累乘法保留连续复利效应</div>
+                <div style="font-size:12px;color:#6b7280;margin-top:4px">价格比法：直接用最新收盘价除以N个交易日前的收盘价，避免涨跌幅缺失值导致窗口偏移</div>
             </div>
             <div style="margin-bottom:12px">
                 <div style="font-weight:600;color:#1f2937;margin-bottom:4px">② 中期动量（30日）</div>
                 <div style="font-family:monospace;background:#fff;padding:8px 12px;border-radius:6px;color:#1d4ed8">
-                    M₂ = [(1+r₁/100)×(1+r₂/100)×...×(1+rₙ/100) − 1] × 100， n = 30
+                    M₂ = (close<sub>今日</sub> / close<sub>30日前</sub> − 1) × 100
                 </div>
             </div>
             <div style="margin-bottom:12px">
@@ -840,7 +1236,9 @@ def generate_html(data):
             <div style="padding:10px 12px;background:#eff6ff;border-radius:6px;border-left:4px solid #3b82f6">
                 <span style="font-weight:600;color:#1e40af">当前参数：</span>
                 短期周期 = 10日，中期周期 = 30日，
-                短期权重 = 0.6，中期权重 = 0.4
+                短期权重 = 0.6，中期权重 = 0.4<br>
+                <span style="font-weight:600;color:#1e40af">计算方法：</span>
+                价格比法（与ETF动量发现、箱体突破发现一致），数据来自通达信pytdx缓存
             </div>
         </div>
     </div>
@@ -848,6 +1246,12 @@ def generate_html(data):
 
 <!-- 持仓列表 -->
 {holdings_html}
+
+<!-- ETF动量发现 (候选推荐) -->
+{etf_candidates_html}
+
+<!-- ETF箱体突破发现 -->
+{breakout_html}
 
 <!-- 今日交易指令 -->
 <div class="section-full">
@@ -887,6 +1291,11 @@ def generate_html(data):
 </div>
 
 </div>
+
+<!-- K线数据 -->
+<script>
+window._klineData = {json.dumps(d["holdings_kline"], ensure_ascii=False)};
+</script>
 
 <script>
 // 资产配置饼图
@@ -1011,7 +1420,101 @@ new Chart(document.getElementById('realtimeMomentumChart'), {{
         }}
     }}
 }});
+
+// ETF动量发现柱状图
+new Chart(document.getElementById('discoveryChart'), {{
+    type: 'bar',
+    data: {{
+        labels: {disc_labels},
+        datasets: [{{
+            label: '综合动量得分(%)',
+            data: {disc_scores},
+            backgroundColor: {disc_colors},
+            borderRadius: 6,
+            barThickness: 28
+        }}]
+    }},
+    options: {{
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {{
+            legend: {{ display: false }},
+            tooltip: {{
+                callbacks: {{
+                    title: function(items) {{
+                        var idx = items[0].dataIndex;
+                        var code = {disc_codes}[idx];
+                        return code ? items[0].label + ' (' + code + ')' : items[0].label;
+                    }},
+                    label: function(ctx) {{ return '综合动量: ' + ctx.raw + '%'; }}
+                }}
+            }}
+        }},
+        scales: {{
+            x: {{
+                grid: {{ color: '#f3f4f6' }},
+                ticks: {{ callback: function(v) {{ return v + '%'; }} }}
+            }},
+            y: {{
+                grid: {{ display: false }}
+            }}
+        }}
+    }}
+}});
+
+// ETF箱体突破柱状图
+new Chart(document.getElementById('breakoutChart'), {{
+    type: 'bar',
+    data: {{
+        labels: {brk_labels},
+        datasets: [{{
+            label: '偏离中轨(%)',
+            data: {brk_devs},
+            backgroundColor: '#f59e0b',
+            borderRadius: 6,
+            barThickness: 28
+        }}, {{
+            label: '量比(x)',
+            data: {brk_vols},
+            backgroundColor: '#3b82f6',
+            borderRadius: 6,
+            barThickness: 28
+        }}]
+    }},
+    options: {{
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {{
+            legend: {{
+                display: true,
+                position: 'top',
+                labels: {{ font: {{ size: 11 }} }}
+            }},
+            tooltip: {{
+                callbacks: {{
+                    title: function(items) {{
+                        var idx = items[0].dataIndex;
+                        var code = {brk_codes}[idx];
+                        return code ? items[0].label + ' (' + code + ')' : items[0].label;
+                    }}
+                }}
+            }}
+        }},
+        scales: {{
+            x: {{
+                grid: {{ color: '#f3f4f6' }},
+                ticks: {{ callback: function(v) {{ return v; }} }}
+            }},
+            y: {{
+                grid: {{ display: false }}
+            }}
+        }}
+    }}
+}});
 </script>
+{kline_js}
 </body>
 </html>'''
 

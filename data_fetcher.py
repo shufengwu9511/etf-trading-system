@@ -1,8 +1,9 @@
 # ============================================================
-# ETF联接基金交易系统 - 数据采集模块 (Tushare Pro版)
-# 宽基ETF → index_daily (指数行情) + index_dailybasic (估值)
-# 行业ETF → fund_daily (ETF日线行情)
-# 恐慌指标 → index_daily(沪深300) + moneyflow_hsgt + stk_limit
+# ETF联接基金交易系统 - 数据采集模块
+# ETF场内K线 → pytdx 通达信 (免费无限流) — 替代 Tushare index_daily/fund_daily
+# 宽基PE估值 → Tushare index_dailybasic (保留)
+# 联接基金净值 → AkShare fund_open_fund_info_em (保留)
+# 恐慌指标 → Tushare moneyflow_hsgt + AkShare 跌停统计 (保留)
 # ============================================================
 import tushare as ts
 import pandas as pd
@@ -10,8 +11,9 @@ import time as _time
 from datetime import datetime, timedelta
 from db import get_connection
 from config import TUSHARE_TOKEN, CORE_ETFS, SATELLITE_ETFS
+import tdx_data  # 通达信免费数据源 (ETF场内K线)
 
-# 初始化 Tushare（直接传 token，跳过 set_token 写文件步骤）
+# 初始化 Tushare（PE估值 + 北向资金 + 交易日历）
 pro = ts.pro_api(TUSHARE_TOKEN)
 
 # 网络重试配置
@@ -20,6 +22,9 @@ _RETRY_DELAY = 2  # 秒
 
 # 沪深300指数代码 (恐慌监控用)
 HS300_INDEX = "000300.SH"
+
+# 数据源标记
+USE_TDX_FOR_ETF_KLINE = True  # ETF场内K线使用通达信 (True) 或 Tushare (False)
 
 
 def _get_date_range(days):
@@ -133,24 +138,28 @@ def fetch_limit_up_count(trade_date):
 
 def update_core_etf_data(etf_config, days=120):
     """
-    更新单只宽基ETF的数据: 行情 + 估值
+    更新单只宽基ETF的数据: 行情(通达信) + 估值(Tushare)
     etf_config: dict with keys "code", "index_code", "name"
     """
     conn = get_connection()
     total = 0
 
-    # 1. 指数日线行情 (用底层指数代码)
-    index_code = etf_config["index_code"]
-    df = fetch_index_daily(index_code, days)
+    # 1. ETF日线行情 (通达信 pytdx 免费数据源)
+    etf_code = etf_config["code"]
+    if USE_TDX_FOR_ETF_KLINE:
+        df = tdx_data.get_etf_kline(etf_code, days)
+    else:
+        # 回退: Tushare index_daily (用底层指数代码)
+        df = fetch_index_daily(etf_config["index_code"], days)
+
     if not df.empty:
         for _, row in df.iterrows():
             try:
-                # 存储时用ETF代码作为主键, 便于策略层统一查询
                 conn.execute("""
                     INSERT OR REPLACE INTO index_daily
                     (ts_code, trade_date, open, close, high, low, vol, amount, pct_chg)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (etf_config["code"], row["trade_date"],
+                """, (etf_code, row["trade_date"],
                       row["open"], row["close"], row["high"], row["low"],
                       row["vol"], row["amount"], row["pct_chg"]))
                 total += 1
@@ -158,7 +167,8 @@ def update_core_etf_data(etf_config, days=120):
                 continue
         conn.commit()
 
-    # 2. 指数估值 (PE/PB)
+    # 2. 指数估值 (PE/PB) — Tushare 保留
+    index_code = etf_config["index_code"]
     df_val = fetch_index_valuation(index_code, days=365 * 5)
     val_count = 0
     if not df_val.empty:
@@ -172,24 +182,31 @@ def update_core_etf_data(etf_config, days=120):
                     INSERT OR REPLACE INTO index_valuation
                     (ts_code, trade_date, pe, pe_ttm, pb)
                     VALUES (?, ?, ?, ?, ?)
-                """, (etf_config["code"], row["trade_date"], row.get("pe"), pe, pb))
+                """, (etf_code, row["trade_date"], row.get("pe"), pe, pb))
                 val_count += 1
             except Exception:
                 continue
         conn.commit()
 
     conn.close()
-    print(f"    [OK] {etf_config['name']} ({index_code}) 行情{total}条 + 估值{val_count}条")
+    source = "通达信" if USE_TDX_FOR_ETF_KLINE else "Tushare"
+    print(f"    [OK] {etf_config['name']} ({etf_code}) [{source}] 行情{total}条 + 估值{val_count}条")
     return total
 
 
 def update_satellite_etf_data(etf_config, days=180):
     """
-    更新单只行业ETF的日线行情
+    更新单只行业ETF的日线行情 (通达信 pytdx)
     etf_config: dict with keys "code", "name"
     """
     conn = get_connection()
-    df = fetch_fund_daily(etf_config["code"], days)
+    etf_code = etf_config["code"]
+
+    if USE_TDX_FOR_ETF_KLINE:
+        df = tdx_data.get_etf_kline(etf_code, days)
+    else:
+        df = fetch_fund_daily(etf_code, days)
+
     count = 0
 
     if not df.empty:
@@ -199,7 +216,7 @@ def update_satellite_etf_data(etf_config, days=180):
                     INSERT OR REPLACE INTO index_daily
                     (ts_code, trade_date, open, close, high, low, vol, amount, pct_chg)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (etf_config["code"], row["trade_date"],
+                """, (etf_code, row["trade_date"],
                       row["open"], row["close"], row["high"], row["low"],
                       row["vol"], row["amount"], row["pct_chg"]))
                 count += 1
@@ -208,7 +225,8 @@ def update_satellite_etf_data(etf_config, days=180):
         conn.commit()
 
     conn.close()
-    print(f"    [OK] {etf_config['name']} ({etf_config['code']}) 行情{count}条")
+    source = "通达信" if USE_TDX_FOR_ETF_KLINE else "Tushare"
+    print(f"    [OK] {etf_config['name']} ({etf_code}) [{source}] 行情{count}条")
     return count
 
 
@@ -290,7 +308,10 @@ def _safe_float(val):
 def run_full_data_update():
     """执行完整数据更新 (每日运行)"""
     print("=" * 60)
-    print(f"[数据更新] 开始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Tushare Pro)")
+    print(f"[数据更新] 开始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  ETF场内K线: {'通达信 pytdx (免费)' if USE_TDX_FOR_ETF_KLINE else 'Tushare'}")
+    print(f"  PE估值/北向: Tushare Pro")
+    print(f"  联接基金净值/跌停: AkShare")
     print("=" * 60)
 
     # 1. 宽基ETF: 指数行情 + 估值
@@ -304,12 +325,22 @@ def run_full_data_update():
         update_satellite_etf_data(etf, days=120)
 
     # 3. 北向资金
-    print("\n[3/4] 更新北向资金...")
+    print("\n[3/5] 更新北向资金...")
     update_north_money(days=60)
 
     # 4. 恐慌监控数据
-    print("\n[4/4] 更新恐慌监控数据...")
+    print("\n[4/5] 更新恐慌监控数据...")
     update_panic_data()
+
+    # 5. 全市场ETF缓存 (动量发现用, 非阻塞)
+    print("\n[5/5] 更新全市场ETF缓存 (动量发现)...")
+    try:
+        from etf_cache_updater import update_etf_cache
+        updated = update_etf_cache()
+        if not updated:
+            print("  (今日已更新, 跳过)")
+    except Exception as e:
+        print(f"  [WARN] 全市场ETF缓存更新失败 (不影响主流程): {e}")
 
     print("\n" + "=" * 60)
     print(f"[数据更新] 完成: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

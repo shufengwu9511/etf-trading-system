@@ -16,32 +16,37 @@ from config import (
 )
 
 
-def _calc_confirm_date(buy_date_str):
+def _calc_confirm_date(submit_date_str):
     """
-    根据申购日期(T日)计算份额确认日期(T+1), 跳过非交易日(周末/节假日)
-    使用 index_daily 表中的交易日期作为交易日历
+    根据提交日期(T日)计算份额确认日期(T+1)。
+    使用 trade_cal 表（上交所官方交易日历），is_open=1 为交易日。
     返回: 确认日期字符串 (YYYYMMDD), 失败返回 None
     """
-    if not buy_date_str:
+    if not submit_date_str:
         return None
     try:
         conn = get_connection()
-        # 从 index_daily 取交易日历, 找 buy_date 之后最近的一个交易日
         row = conn.execute("""
-            SELECT trade_date FROM index_daily
-            WHERE trade_date > ?
-            ORDER BY trade_date ASC
+            SELECT cal_date FROM trade_cal
+            WHERE exchange = 'SSE'
+              AND is_open = 1
+              AND cal_date > ?
+            ORDER BY cal_date ASC
             LIMIT 1
-        """, (buy_date_str,)).fetchone()
+        """, (submit_date_str,)).fetchone()
         conn.close()
-
         if row:
-            return row["trade_date"]
-        # fallback: 如果交易日历里没有(极端情况), 用 buy_date +1 自然日
-        buy = datetime.strptime(buy_date_str, "%Y%m%d")
-        return (buy + timedelta(days=1)).strftime("%Y%m%d")
+            return row["cal_date"]
+        # fallback: trade_cal 数据未覆盖时，向后找10个自然日
+        buy = datetime.strptime(submit_date_str, "%Y%m%d")
+        for i in range(1, 11):
+            d = buy + timedelta(days=i)
+            # 简单跳过周末
+            if d.weekday() < 5:
+                return d.strftime("%Y%m%d")
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _calc_hold_days(confirm_date_str):
@@ -358,7 +363,7 @@ def update_holdings_nav():
 # 持仓卖出 (标记赎回)
 # ============================================================
 
-def sell_holding(fund_code):
+def sell_holding(fund_code, submit_date=None, confirm_date=None):
     """
     标记某只基金为已赎回, 记录交易日志
     fund_code: 联接基金代码
@@ -389,7 +394,14 @@ def sell_holding(fund_code):
         return False
 
     h = dict(row)
-    confirm_date = datetime.now().strftime("%Y%m%d")
+    # 确认日: 使用指定的，或自动计算下一个交易日(T+1)
+    if confirm_date is None:
+        _submit = submit_date or h.get("buy_date") or datetime.now().strftime("%Y%m%d")
+        confirm_date = _calc_confirm_date(_submit)
+        if confirm_date is None:
+            confirm_date = datetime.now().strftime("%Y%m%d")
+    if submit_date is None:
+        submit_date = h.get("buy_date") or confirm_date
     sell_amount = h["market_value"]
 
     # 更新状态
@@ -1000,12 +1012,15 @@ def confirm_buy(fund_code, shares, nav, confirm_date=None):
 # 部分赎回
 # ============================================================
 
-def sell_holding_partial(fund_code, ratio=None, shares=None):
+def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, confirm_date=None):
     """
     赎回持仓 (支持部分赎回)
     参数二选一:
       - shares: 直接指定赎回份额数 (如 5000)
       - ratio:  赎回比例 (0.0 ~ 1.0), 如 0.5=赎回一半
+    可选参数:
+      - submit_date: 申请日期 (YYYYMMDD格式), 默认使用持仓买入日期或当天
+      - confirm_date: 确认日期 (YYYYMMDD格式), 默认使用当天
     若都不指定, 则全部赎回
     """
     conn = get_connection()
@@ -1032,7 +1047,14 @@ def sell_holding_partial(fund_code, ratio=None, shares=None):
         return False
 
     h = dict(row)
-    confirm_date = datetime.now().strftime("%Y%m%d")
+    # 确认日: 使用指定的，或自动计算下一个交易日(T+1)
+    if confirm_date is None:
+        confirm_date = _calc_confirm_date(submit_date or h["buy_date"] or datetime.now().strftime("%Y%m%d"))
+        if confirm_date is None:
+            confirm_date = datetime.now().strftime("%Y%m%d")
+    # 提交日期: 使用指定的，或持仓买入日期
+    if submit_date is None:
+        submit_date = h["buy_date"] or confirm_date
     total_shares = h["shares"]
 
     # 计算赎回份额
@@ -1074,7 +1096,7 @@ def sell_holding_partial(fund_code, ratio=None, shares=None):
             VALUES (?, ?, ?, 'sell', ?, ?, ?, 0, 'done', ?, ?, ?, 'manual', ?)
         """, (h["fund_code"], h["etf_code"], h["name"],
               round(sell_amount, 2), h["shares"], h["current_nav"],
-              h["buy_date"] or confirm_date, confirm_date, None,
+              submit_date, confirm_date, None,
               f"手动赎回: 成本¥{h['total_cost']:,.0f}, 市值¥{sell_amount:,.0f}, 盈亏{h['profit_pct']:+.2f}%"))
 
         emoji = "🟢" if h["profit_pct"] >= 0 else "🔴"
@@ -1106,7 +1128,7 @@ def sell_holding_partial(fund_code, ratio=None, shares=None):
             VALUES (?, ?, ?, 'sell', ?, ?, ?, 0, 'done', ?, ?, ?, 'manual', ?)
         """, (h["fund_code"], h["etf_code"], h["name"],
               round(sell_amount, 2), sell_shares, h["current_nav"],
-              confirm_date, confirm_date, None,
+              submit_date, confirm_date, None,
               f"部分赎回({actual_ratio:.1%}): {sell_shares:.2f}份, ¥{sell_amount:,.0f}, 盈亏¥{sell_profit:+,.0f}"))
 
         emoji = "🟢" if sell_profit >= 0 else "🔴"

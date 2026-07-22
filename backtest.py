@@ -23,8 +23,9 @@ from config import (
     MOMENTUM_SHORT, MOMENTUM_MEDIUM, MOMENTUM_WEIGHT_SHORT, MOMENTUM_WEIGHT_MEDIUM,
     MOMENTUM_MIN_THRESHOLD,
     ROTATION_HOLD_COUNT, ROTATION_CYCLE_DAYS,
-    TAKE_PROFIT_TIER1, TAKE_PROFIT_TIER2,
     STOP_LOSS_THRESHOLD, STOP_LOSS_PANIC_THRESHOLD, MIN_HOLD_DAYS,
+    TRAILING_STOP_ACTIVATE, TRAILING_STOP_PULLBACK,
+    TRAILING_STOP_PANIC_PULLBACK, TRAILING_STOP_TOP1_PULLBACK,
 )
 
 
@@ -123,26 +124,24 @@ def check_ma_trend_bt(ts_code, current_date, prices):
 
 
 def calc_momentum_bt(ts_code, current_date, prices):
-    """计算动量得分 (回测版)"""
+    """计算动量得分 (回测版 — 价格比法)
+
+    与 strategy.py / etf_discovery.py 保持一致:
+      n日动量 = 最新收盘价 / n日前收盘价 - 1
+    """
     price_list = prices.get(ts_code, [])
     valid = [p for p in price_list if p["date"] <= current_date]
 
-    if len(valid) < MOMENTUM_MEDIUM:
+    if len(valid) < MOMENTUM_MEDIUM + 1:
         return None
 
-    pct_changes = [p["pct_chg"] for p in valid]
+    closes = [p["close"] for p in valid]
 
-    # 20日动量 (乘积法)
-    m20 = 1.0
-    for r in pct_changes[-MOMENTUM_SHORT:]:
-        m20 *= (1 + r / 100.0)
-    m20 = (m20 - 1) * 100.0
+    # 短期动量 (价格比法)
+    m20 = (closes[-1] / closes[-(MOMENTUM_SHORT + 1)] - 1) * 100.0
 
-    # 60日动量
-    m60 = 1.0
-    for r in pct_changes[-MOMENTUM_MEDIUM:]:
-        m60 *= (1 + r / 100.0)
-    m60 = (m60 - 1) * 100.0
+    # 中期动量 (价格比法)
+    m60 = (closes[-1] / closes[-(MOMENTUM_MEDIUM + 1)] - 1) * 100.0
 
     composite = m20 * MOMENTUM_WEIGHT_SHORT + m60 * MOMENTUM_WEIGHT_MEDIUM
     return {"momentum_20d": m20, "momentum_60d": m60, "composite": composite}
@@ -170,6 +169,8 @@ class BacktestEngine:
         self.trades = []
         # 每日净值曲线
         self.daily_values = []
+        # 移动止盈: 跟踪每个持仓的峰值利润率
+        self.peak_pnl = {}
 
     def _date_diff(self, d1, d2):
         """计算两个YYYYMMDD之间的自然日天数"""
@@ -345,38 +346,42 @@ class BacktestEngine:
                 pnl_pct = (price / h["cost_nav"] - 1) * 100
                 hold_days = self._date_diff(date, h["buy_date"])
 
-                # 最短持有期检查 (盈利时)
+                # 最短持有期检查 (盈利时跳过, 避免赎回费)
                 if hold_days < MIN_HOLD_DAYS and pnl_pct > 0:
                     continue
 
-                # 动量排名前N, 跳过止盈让利润奔跑
-                if code in top_codes:
-                    continue
+                # 初始化峰值跟踪
+                if code not in self.peak_pnl:
+                    self.peak_pnl[code] = 0.0
 
-                # 阶梯止盈
-                if pnl_pct >= TAKE_PROFIT_TIER2:
-                    # 第二档: 全部卖出
-                    self._sell_etf(h["name"], code, date, "satellite")
-                    self.trades[-1]["tier"] = "T2"
-                    trade_count += 1
-                elif pnl_pct >= TAKE_PROFIT_TIER1:
-                    # 第一档: 卖出一半
-                    half_shares = h["shares"] / 2
-                    amount = half_shares * price
-                    self.cash += amount
-                    self.trades.append({
-                        "date": date, "type": "sell_half", "name": h["name"], "code": code,
-                        "amount": amount, "shares": half_shares, "price": price,
-                        "pnl_pct": pnl_pct, "tier": "T1"
-                    })
-                    h["shares"] -= half_shares
-                    trade_count += 1
+                # 确定回撤阈值
+                is_top1 = bool(eligible_scores) and code == eligible_scores[0][0]
+                if is_top1:
+                    trailing_pullback = TRAILING_STOP_TOP1_PULLBACK
+                else:
+                    trailing_pullback = TRAILING_STOP_PULLBACK
 
-                # 止损 (不受动量排名限制)
+                # === 移动止盈: 激活后跟踪峰值 ===
+                if pnl_pct >= TRAILING_STOP_ACTIVATE:
+                    if pnl_pct > self.peak_pnl[code]:
+                        self.peak_pnl[code] = pnl_pct
+
+                # 从峰值回撤超过阈值 → 清仓
+                if self.peak_pnl[code] > 0 and (self.peak_pnl[code] - pnl_pct) >= trailing_pullback:
+                    if code in self.sat_holdings:
+                        self._sell_etf(h["name"], code, date, "satellite")
+                        self.trades[-1]["tier"] = f"TS(pk{self.peak_pnl[code]:.1f}%)"
+                        del self.peak_pnl[code]
+                        trade_count += 1
+                        continue  # 已清仓, 不再检查止损
+
+                # === 止损 (不变) ===
                 stop_loss = abs(STOP_LOSS_THRESHOLD)
                 if pnl_pct <= -stop_loss and hold_days >= MIN_HOLD_DAYS:
-                    if code in self.sat_holdings:  # 可能已止盈卖出
+                    if code in self.sat_holdings:
                         self._sell_etf(h["name"], code, date, "satellite")
+                        if code in self.peak_pnl:
+                            del self.peak_pnl[code]
                         trade_count += 1
 
             # --- 轮动检查 (每14天) ---
@@ -401,6 +406,8 @@ class BacktestEngine:
                                 hold_days = self._date_diff(date, h["buy_date"])
                                 if hold_days >= ROTATION_CYCLE_DAYS:
                                     self._sell_etf(h["name"], code, date, "satellite")
+                                    if code in self.peak_pnl:
+                                        del self.peak_pnl[code]
                                     trade_count += 1
 
                         # 买入: 排名靠前但未持有
@@ -517,7 +524,7 @@ class BacktestEngine:
         report_lines.append(f"  宽基比例: {CORE_RATIO*100:.0f}%  行业比例: {SATELLITE_RATIO*100:.0f}%")
         report_lines.append(f"  动量周期: {MOMENTUM_SHORT}日/{MOMENTUM_MEDIUM}日, 权重{MOMENTUM_WEIGHT_SHORT}/{MOMENTUM_WEIGHT_MEDIUM}")
         report_lines.append(f"  轮动持仓: 前{ROTATION_HOLD_COUNT}只, 轮动周期{ROTATION_CYCLE_DAYS}天")
-        report_lines.append(f"  止盈: +{TAKE_PROFIT_TIER1:.0f}%卖半仓 / +{TAKE_PROFIT_TIER2:.0f}%清仓  止损: {STOP_LOSS_THRESHOLD:.0f}%")
+        report_lines.append(f"  止盈: 移动止盈(激活+{TRAILING_STOP_ACTIVATE:.0f}%, 回撤{TRAILING_STOP_PULLBACK:.0f}%, Top1容限{TRAILING_STOP_TOP1_PULLBACK:.0f}%)  止损: {STOP_LOSS_THRESHOLD:.0f}%")
         report_lines.append(f"  PE择时: <{PE_BUY_THRESHOLD}%买入, >{PE_SELL_THRESHOLD}%卖出 (5年百分位)")
         report_lines.append(f"  动量门槛: 综合得分>{MOMENTUM_MIN_THRESHOLD}%才纳入轮动")
         report_lines.append("=" * 65)

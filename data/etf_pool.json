@@ -12,5 +12,40 @@
     "category": "manufacture",
     "fund_code": "020972",
     "company": "易方达"
+  },
+  {
+    "code": "562950.SH",
+    "name": "消费电子ETF联接A",
+    "fund_code": "018896",
+    "category": "satellite",
+    "company": "易方达"
+  },
+  {
+    "code": "159781.SZ",
+    "name": "科创创业50ETF联接A",
+    "fund_code": "013304",
+    "category": "satellite",
+    "company": "易方达"
+  },
+  {
+    "code": "588160.SH",
+    "name": "科创新材料ETF联接A",
+    "fund_code": "020685",
+    "category": "satellite",
+    "company": "南方基金管理股份有限公司"
+  },
+  {
+    "code": "515120.SH",
+    "name": "创新药ETF联接A",
+    "fund_code": "019666",
+    "category": "satellite",
+    "company": "易方达"
+  },
+  {
+    "code": "515650.SH",
+    "name": "消费50ETF联接A",
+    "fund_code": "008975",
+    "category": "satellite",
+    "company": "富国"
   }
 ]
