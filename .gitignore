@@ -8,6 +8,8 @@ local_secrets.py
 
 # 数据库
 data/*.db
+data/*.bak*
+data/tdx_cache/
 
 # 日志
 logs/

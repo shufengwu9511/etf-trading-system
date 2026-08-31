@@ -13,6 +13,7 @@ from config import (
     SIGNAL_CUTOFF_TIME, TRADE_EXECUTION_REMINDER,
     CORE_ETFS, SATELLITE_ETFS, MIN_HOLD_DAYS,
     TUSHARE_TOKEN, MOMENTUM_SHORT, MOMENTUM_MEDIUM,
+    TRAILING_STOP_ACTIVATE,
 )
 
 
@@ -477,15 +478,21 @@ def update_holding(fund_code, new_shares=None, new_cost_nav=None, add_shares=Non
         new_profit_loss = new_market_value - new_total_cost
         new_profit_pct = (new_profit_loss / new_total_cost * 100) if new_total_cost > 0 else 0
 
+        # 加仓后成本基准变化, 峰值重新起算:
+        # 新盈亏已达激活阈值 → 继续跟踪(peak=当前盈亏); 否则置0等待重新激活
+        new_peak = new_profit_pct if new_profit_pct >= TRAILING_STOP_ACTIVATE else 0
+
         conn.execute("""
             UPDATE portfolio
             SET shares = ?, cost_nav = ?, total_cost = ?, buy_amount = ?,
                 market_value = ?, profit_loss = ?, profit_pct = ?,
+                peak_profit_pct = ?,
                 updated_at = datetime('now', 'localtime')
             WHERE id = ?
         """, (new_total_shares, round(avg_cost_nav, 4), round(new_total_cost, 2),
               round(new_total_cost, 2),
               round(new_market_value, 2), round(new_profit_loss, 2), round(new_profit_pct, 2),
+              round(new_peak, 2),
               h["id"]))
 
         # 记录交易
@@ -845,6 +852,9 @@ def save_signals_to_db(signals_result, panic_alert):
     """将信号保存到数据库"""
     conn = get_connection()
     today = datetime.now().strftime("%Y%m%d")
+
+    # 先清除当天旧信号, 避免重复运行导致数据重复
+    conn.execute("DELETE FROM signals WHERE signal_date = ?", (today,))
 
     for sig in signals_result.get("core", []):
         _insert_signal(conn, today, "core_pe", sig)

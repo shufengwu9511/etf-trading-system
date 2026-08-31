@@ -74,14 +74,18 @@ ROTATION_CYCLE_DAYS = 14                # 轮动周期 (天)
 
 # 移动止盈 + 止损
 # 移动止盈: 利润超过激活阈值后跟踪峰值, 从峰值回撤超过阈值则清仓
-TRAILING_STOP_ACTIVATE = 6.0            # 激活阈值: 利润≥+6%开始跟踪峰值
-TRAILING_STOP_PULLBACK = 4.0            # 回撤阈值: 从峰值回撤4%触发清仓
-TRAILING_STOP_PANIC_PULLBACK = 3.0      # 恐慌模式回撤收紧至3%
-TRAILING_STOP_TOP1_PULLBACK = 6.0       # 动量排名第1的容限6% (让最强趋势多跑)
+# 针对场外联接基金T+1执行延迟优化 (盘后申赎, 信号日→执行日隔1天)
+TRAILING_STOP_ACTIVATE = 8.0            # 激活阈值: 利润≥+8%开始跟踪峰值 (原6%, 提高以吸收延迟)
+TRAILING_STOP_PULLBACK = 6.0            # 回撤阈值: 从峰值回撤6%触发清仓 (原4%, 覆盖1天执行延迟+正常波动)
+TRAILING_STOP_PANIC_PULLBACK = 5.0      # 恐慌模式回撤收紧至5% (原3%, 恐慌时波动更大但仍需留余量)
+TRAILING_STOP_TOP1_PULLBACK = 8.0       # 动量Top1容限8% (原6%, 让最强趋势多跑, 抵消延迟)
 # 止损 (不变)
 STOP_LOSS_THRESHOLD = -15.0             # 止损 -15%
 STOP_LOSS_PANIC_THRESHOLD = -8.0        # 恐慌预警时收紧止损至 -8%
 MIN_HOLD_DAYS = 7                       # 最短持有天数 (按份额确认日算自然日, 避免赎回费)
+
+# MA20 趋势闸门 (买入过滤 + 趋势止损)
+MA20_STOP_LOSS_RATIO = 0.95             # 跌破MA20的5%触发趋势止损 (场外T+1需更宽缓冲, 原0.98太敏感)
 
 # 保留旧参数以兼容 (已弃用, 仅用于向后兼容)
 TAKE_PROFIT_THRESHOLD = 5.0

@@ -489,3 +489,114 @@ def batch_get_etf_klines(codes: list, days: int = 120) -> dict:
             print(f"    [WARN] 通达信拉取 {code} 失败: {e}")
             results[code] = pd.DataFrame()
     return results
+
+
+# ============================================================
+# 实时行情 (盘中现价) — 供盘中信号脚本使用
+# ============================================================
+
+# 基金/ETF类代码前缀 (实时报价为10倍, 需除以10还原)
+_FUND_CODE_PREFIXES = ("15", "16", "50", "51", "56", "58", "59")
+
+
+def _is_fund_code(raw_code: str) -> bool:
+    """判断通达信代码是否为基金/ETF类 (这些品种的实时报价是10倍关系)"""
+    return raw_code.startswith(_FUND_CODE_PREFIXES)
+
+
+def _resolve_quote_scale(code: str, last_close: float,
+                         prev_close_map: Optional[dict] = None) -> float:
+    """确定实时报价的缩放系数
+
+    通达信 pytdx get_security_quotes() 对基金/ETF的价格字段返回的是"10倍"
+    值 (报价单位为厘/分), 而股票返回正常元值。例如:
+      黄金ETF 159934: 报 99.41 → 真实 9.941
+      半导体ETF 159558: 报 11.62 → 真实 1.162
+
+    优先用数据库昨收校准 (日K线价格是正常的):
+      若 last_close/10 比 last_close 更接近昨收, 则缩放系数为10;
+    无昨收时按代码前缀判断。
+    """
+    if prev_close_map:
+        pc = prev_close_map.get(code)
+        if pc:
+            d_ten = abs(last_close / 10 - pc)
+            d_one = abs(last_close - pc)
+            if d_ten < d_one:
+                return 10.0
+            return 1.0
+    _market, raw = _parse_ts_code(code)
+    return 10.0 if _is_fund_code(raw) else 1.0
+
+
+def get_realtime_quotes(codes: list, prev_close_map: Optional[dict] = None) -> dict:
+    """批量获取ETF盘中实时行情 (pytdx get_security_quotes)
+
+    Args:
+        codes: ETF代码列表 (Tushare格式), 如 ['159934.SZ', '510310.SH']
+        prev_close_map: {code: 昨收真实价} 用于校准10倍缩放; 传None时仅按前缀判断
+
+    Returns:
+        {code: {"price", "last_close", "open", "high", "low", "change_pct", "servertime"}}
+        所有价格字段均已还原为真实价格(元)。失败返回空dict。
+    """
+    if not codes:
+        return {}
+    codes = [c for c in codes if c]
+
+    # 解析为 (market, raw_code)
+    items = []
+    for code in codes:
+        market, raw = _parse_ts_code(code)
+        items.append((market, raw, code))
+    item_map = {(m, r): c for m, r, c in items}
+
+    quotes = {}
+    api = TdxHq_API()
+    try:
+        ip, port = _get_server()
+        if not api.connect(ip, port, time_out=3):
+            raise ConnectionError("无法连接通达信行情服务器")
+
+        # 通达信单次最多返回80条, 分批请求
+        reqs = [(m, r) for m, r, _ in items]
+        for i in range(0, len(reqs), 80):
+            batch = reqs[i:i + 80]
+            raw_quotes = api.get_security_quotes(batch) or []
+            for rq in raw_quotes:
+                code = item_map.get((rq.get("market"), str(rq.get("code"))))
+                if not code:
+                    continue
+                try:
+                    price = float(rq["price"])
+                    last_close = float(rq["last_close"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                scale = _resolve_quote_scale(code, last_close, prev_close_map)
+                if scale <= 0:
+                    continue
+                lc = last_close / scale
+                px = price / scale
+                quotes[code] = {
+                    "price": px,
+                    "last_close": lc,
+                    "open": float(rq.get("open", 0)) / scale,
+                    "high": float(rq.get("high", 0)) / scale,
+                    "low": float(rq.get("low", 0)) / scale,
+                    "change_pct": round((px / lc - 1) * 100, 2) if lc else 0.0,
+                    "servertime": str(rq.get("servertime", "")),
+                }
+    except Exception:
+        pass
+    finally:
+        try:
+            api.disconnect()
+        except Exception:
+            pass
+    return quotes
+
+
+def get_realtime_quote(code: str, prev_close_map: Optional[dict] = None) -> Optional[dict]:
+    """获取单只ETF盘中实时行情 (见 get_realtime_quotes)"""
+    result = get_realtime_quotes([code], prev_close_map)
+    return result.get(code)

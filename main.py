@@ -31,6 +31,26 @@ from dashboard import generate_dashboard
 from config import LOG_DIR
 
 
+def _cleanup_old_logs(keep_days=7):
+    """清理logs目录, 只保留近 keep_days 天的文件 (dashboard.html 和 JS 库不受影响)"""
+    import glob
+    from datetime import timedelta
+    cutoff = datetime.now() - timedelta(days=keep_days)
+    patterns = ["action_sheet_*.txt", "run_*.log", "backtest_report_*.txt"]
+    removed = 0
+    for pattern in patterns:
+        for filepath in glob.glob(os.path.join(LOG_DIR, pattern)):
+            mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+            if mtime < cutoff:
+                try:
+                    os.remove(filepath)
+                    removed += 1
+                except OSError:
+                    pass
+    if removed:
+        print(f"  [OK] 清理旧日志: 删除{removed}个文件 (保留近{keep_days}天)")
+
+
 def run_daily():
     """每日主流程"""
     start_time = time.time()
@@ -160,6 +180,9 @@ def run_daily():
         print(f"\n  📊 可视化看板: {dashboard_path}")
     except Exception as e:
         print(f"\n  [WARN] 看板生成失败: {e}")
+
+    # 清理旧日志 (保留近7天)
+    _cleanup_old_logs()
 
     # 记录运行日志
     elapsed = time.time() - start_time

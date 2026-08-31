@@ -16,6 +16,7 @@ from config import (
     TRAILING_STOP_ACTIVATE, TRAILING_STOP_PULLBACK,
     TRAILING_STOP_PANIC_PULLBACK, TRAILING_STOP_TOP1_PULLBACK,
     STOP_LOSS_THRESHOLD, STOP_LOSS_PANIC_THRESHOLD, MIN_HOLD_DAYS,
+    MA20_STOP_LOSS_RATIO,
     # 恐慌监控
     PANIC_HS300_DROP, PANIC_NORTH_OUTFLOW, PANIC_LIMIT_DOWN_COUNT,
     PANIC_VOLUME_RATIO, PANIC_TRIGGER_COUNT,
@@ -37,49 +38,51 @@ def check_panic_alert():
     """
     conn = get_connection()
     try:
-        latest_date = _get_latest_trade_date(conn)
-        if not latest_date:
-            return {"is_panic": False, "triggered": [], "details": {}}
-
         triggered = []
         details = {}
+        dates = {}  # 各指标各自的数据日期
 
-        # 指标1: 沪深300单日跌幅
-        hs300_pct = _get_hs300_pct_chg(conn, latest_date)
+        # 指标1: 沪深300单日跌幅 (取HS300最新可用数据)
+        hs300_pct, hs300_date = _get_hs300_pct_chg(conn)
         details["hs300_pct_chg"] = hs300_pct
+        dates["hs300_date"] = hs300_date
         if hs300_pct is not None and hs300_pct <= PANIC_HS300_DROP:
             triggered.append(f"沪深300跌幅{hs300_pct:.2f}% (阈值{PANIC_HS300_DROP:.1f}%)")
 
-        # 指标2: 北向资金净流出
-        north_money = _get_north_money(conn, latest_date)
+        # 指标2: 北向资金净流出 (取最新可用数据)
+        north_money, north_date = _get_north_money(conn)
         details["north_money"] = north_money
+        dates["north_date"] = north_date
         if north_money is not None and north_money <= -PANIC_NORTH_OUTFLOW:
             triggered.append(f"北向资金净流出{abs(north_money)/10000:.1f}亿 (阈值{PANIC_NORTH_OUTFLOW/10000:.0f}亿)")
 
-        # 指标3: 跌停家数（单独用 limit_down_stats 最新日期，避免 index_daily T+1 延迟导致数据错位）
-        ld_date = _get_latest_limit_down_date(conn) or latest_date
-        limit_down = _get_limit_down(conn, ld_date)
+        # 指标3: 跌停家数（AkShare, 当天盘中就有）
+        limit_down, ld_date = _get_limit_down(conn)
         details["limit_down_count"] = limit_down
+        dates["limit_down_date"] = ld_date
         if limit_down is not None and limit_down >= PANIC_LIMIT_DOWN_COUNT:
             triggered.append(f"跌停{limit_down}家 (阈值{PANIC_LIMIT_DOWN_COUNT}家)")
 
-        # 指标4: 成交量异常放大
-        vol_ratio = _get_volume_ratio(conn, latest_date)
+        # 指标4: 成交量异常放大 (基于HS300最新数据)
+        vol_ratio, vol_date = _get_volume_ratio(conn)
         details["volume_ratio"] = vol_ratio
+        dates["volume_date"] = vol_date
         if vol_ratio is not None and vol_ratio >= PANIC_VOLUME_RATIO:
             triggered.append(f"成交量放大{vol_ratio:.1f}倍 (阈值{PANIC_VOLUME_RATIO:.1f}倍)")
 
         is_panic = len(triggered) >= PANIC_TRIGGER_COUNT
 
-        # 记录预警（用 ld_date 作为基准，确保跌停数据与记录日期一致）
-        record_date = ld_date if ld_date > latest_date else latest_date
-        _save_panic_alert(conn, record_date, is_panic, triggered, details)
+        # 用各数据源最新日期中最大的作为记录日期
+        valid_dates = [d for d in dates.values() if d]
+        record_date = max(valid_dates) if valid_dates else None
+        _save_panic_alert(conn, record_date, is_panic, triggered, details, dates)
 
         return {
             "is_panic": is_panic,
             "triggered": triggered,
             "trigger_count": len(triggered),
             "details": details,
+            "dates": dates,
             "trade_date": record_date
         }
 
@@ -213,10 +216,11 @@ def calc_momentum_scores():
     for _, row in df.iterrows():
         conn.execute("""
             INSERT OR REPLACE INTO momentum_scores
-            (trade_date, etf_code, name, category, momentum_20d, momentum_60d, composite_score, rank)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (trade_date, etf_code, name, category, momentum_20d, momentum_60d, composite_score, rank, ma20, above_ma20)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (trade_date, row["etf_code"], row["name"], row["category"],
-              row["momentum_20d"], row["momentum_60d"], row["composite_score"], row["rank"]))
+              row["momentum_20d"], row["momentum_60d"], row["composite_score"], row["rank"],
+              row.get("ma20"), 1 if row.get("above_ma20") else 0))
     conn.commit()
     conn.close()
 
@@ -235,6 +239,10 @@ def check_rotation_signals(holdings):
 
     # 动量门槛过滤: 综合得分 <= 0 的ETF不纳入轮动
     eligible = momentum_df[momentum_df["composite_score"] > MOMENTUM_MIN_THRESHOLD].copy()
+
+    # MA20趋势闸门: 收盘价在MA20上方才允许买入 (趋势方向确认)
+    eligible = eligible[eligible["above_ma20"] == True] if "above_ma20" in eligible.columns else eligible
+
     if eligible.empty:
         # 所有ETF动量都不够, 没有新的买入信号
         top_codes = set()
@@ -270,10 +278,11 @@ def check_rotation_signals(holdings):
                 "name": row["name"],
                 "category": row["category"],
                 "direction": "buy",
-                "reason": f"动量排名第{row['rank']}, 综合得分{row['composite_score']:.4f}",
+                "reason": f"动量排名第{row['rank']}, 综合得分{row['composite_score']:.4f}, MA20上方",
                 "momentum_20d": row["momentum_20d"],
                 "momentum_60d": row["momentum_60d"],
-                "composite_score": row["composite_score"]
+                "composite_score": row["composite_score"],
+                "above_ma20": True
             })
 
     # 需要卖出的: 持有但排名靠后, 且持有满轮动周期
@@ -345,10 +354,10 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
     """
     检查所有持仓的止盈止损信号 (移动止盈版)
     is_panic: 是否处于恐慌预警状态 (收紧止损阈值和回撤阈值)
-    momentum_top_codes: 动量排名前N的ETF代码集合, 排名第1的使用更宽的移动止盈容限
+    momentum_top_codes: 动量排名第1的ETF代码集合, 使用更宽的移动止盈容限
 
     移动止盈逻辑:
-      利润 >= 激活阈值 → 开始跟踪每日利润峰值
+      利润 >= 激活阈值 → 开始跟踪每日利润峰值 (峰值持久化到数据库)
       从峰值回撤 >= 回撤阈值 → 清仓
       动量排名第1: 回撤容限放宽至 TRAILING_STOP_TOP1_PULLBACK
     """
@@ -357,6 +366,9 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
     signals = []
     stop_loss = abs(STOP_LOSS_PANIC_THRESHOLD if is_panic else STOP_LOSS_THRESHOLD)
     trailing_pullback = TRAILING_STOP_PANIC_PULLBACK if is_panic else TRAILING_STOP_PULLBACK
+
+    conn = get_connection()
+    peak_updates = []
 
     for h in holdings:
         profit_pct = h.get("profit_pct", 0)
@@ -371,27 +383,20 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
             continue
 
         # 确定此持仓的回撤阈值
-        is_top1 = momentum_top_codes and h["etf_code"] in momentum_top_codes
-        # 检查是否是NO.1
-        if is_top1 and len(momentum_top_codes) > 0:
-            # 需要通过动量排名确认是否为第1
-            # 这里简化: 只要在前N中就用宽松阈值, 第1在外部精确判断
-            if is_panic:
-                etf_pullback = TRAILING_STOP_PANIC_PULLBACK
-            else:
-                etf_pullback = trailing_pullback  # 标准回撤
+        is_top1 = bool(momentum_top_codes) and h.get("etf_code") in momentum_top_codes
+        if is_top1 and not is_panic:
+            etf_pullback = TRAILING_STOP_TOP1_PULLBACK
         else:
             etf_pullback = trailing_pullback
 
         # === 移动止盈 ===
-        # 获取该持仓的利润峰值 (从数据库读取)
-        peak_profit = h.get("peak_profit_pct", 0)
+        peak_profit = h.get("peak_profit_pct") or 0
 
-        # 更新峰值
-        if profit_pct >= TRAILING_STOP_ACTIVATE:
-            if profit_pct > peak_profit:
-                # 需要在数据库中更新 peak_profit_pct
-                peak_profit = profit_pct
+        # 利润≥激活阈值且创新高 → 更新峰值并持久化
+        if profit_pct >= TRAILING_STOP_ACTIVATE and profit_pct > peak_profit:
+            peak_profit = profit_pct
+            if h.get("id"):
+                peak_updates.append((peak_profit, h["id"]))
 
         # 从峰值回撤超过阈值 → 清仓信号
         if peak_profit > 0 and (peak_profit - profit_pct) >= etf_pullback:
@@ -410,7 +415,28 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
             })
             continue  # 已生成止盈信号, 不再检查止损
 
-        # === 止损 (不变) ===
+        # === MA20趋势止损 ===
+        # 收盘价跌破MA20×0.95视为趋势结构破坏, 离场
+        # 受MIN_HOLD_DAYS约束 (方案A: 7天内先扛, 省赎回费, 极端情况由恐慌止损兜底)
+        if hold_days >= MIN_HOLD_DAYS:
+            close, ma20 = _get_latest_close_and_ma20(conn, h["etf_code"])
+            if close is not None and ma20 is not None and close < ma20 * MA20_STOP_LOSS_RATIO:
+                below_pct = (close / ma20 - 1) * 100
+                signals.append({
+                    "etf_code": h["etf_code"],
+                    "fund_code": h["fund_code"],
+                    "name": h["name"],
+                    "category": h["category"],
+                    "direction": "sell",
+                    "signal_type": "trend_stop",
+                    "reason": f"趋势止损: 收盘{close:.4f} < MA20×{MA20_STOP_LOSS_RATIO}({ma20 * MA20_STOP_LOSS_RATIO:.4f}), 跌破均线{below_pct:.2f}%",
+                    "profit_pct": profit_pct,
+                    "sell_ratio": 1.0,
+                    "priority": "high"
+                })
+                continue  # 趋势止损触发, 不再检查固定止损
+
+        # === 止损 ===
         if profit_pct <= -stop_loss:
             signals.append({
                 "etf_code": h["etf_code"],
@@ -425,6 +451,14 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
                 "priority": "urgent" if is_panic else "high"
             })
 
+    # 批量更新峰值到数据库
+    if peak_updates:
+        for peak_val, hid in peak_updates:
+            conn.execute("UPDATE portfolio SET peak_profit_pct = ? WHERE id = ?", (peak_val, hid))
+        conn.commit()
+        print(f"  [OK] 利润峰值更新: {len(peak_updates)}只持仓")
+
+    conn.close()
     return signals
 
 
@@ -440,65 +474,87 @@ def _get_latest_trade_date(conn):
     return row["latest"] if row and row["latest"] else None
 
 
-def _get_latest_limit_down_date(conn):
-    """获取 limit_down_stats 里的最新交易日（可能比 index_daily 更新）"""
+def _get_latest_close_and_ma20(conn, ts_code, ma_period=20):
+    """获取最新收盘价和MA20均线值, 返回 (close, ma20)"""
+    rows = conn.execute("""
+        SELECT close FROM index_daily
+        WHERE ts_code = ? AND close IS NOT NULL AND close > 0
+        ORDER BY trade_date DESC LIMIT ?
+    """, (ts_code, ma_period)).fetchall()
+    if len(rows) < ma_period:
+        return (None, None)
+    closes = [r["close"] for r in reversed(rows)]
+    return (closes[-1], round(sum(closes) / ma_period, 4))
+
+
+def _get_hs300_pct_chg(conn):
+    """获取沪深300最新交易日的涨跌幅, 返回 (value, date)"""
     row = conn.execute("""
-        SELECT MAX(trade_date) as latest FROM limit_down_stats
+        SELECT pct_chg, trade_date FROM index_daily
+        WHERE ts_code = '000300.SH'
+        ORDER BY trade_date DESC LIMIT 1
     """).fetchone()
-    return row["latest"] if row and row["latest"] else None
+    if row and row["pct_chg"] is not None:
+        return (row["pct_chg"], row["trade_date"])
+    return (None, None)
 
 
-def _get_hs300_pct_chg(conn, date):
-    """获取沪深300当日涨跌幅 (百分比数值, 如 -2.5 表示跌2.5%)"""
+def _get_north_money(conn):
+    """获取最新交易日的北向资金��流入, 返回 (value, date)"""
     row = conn.execute("""
-        SELECT pct_chg FROM index_daily
-        WHERE ts_code = '000300.SH' AND trade_date = ?
-    """, (date,)).fetchone()
-    return row["pct_chg"] if row and row["pct_chg"] is not None else None
+        SELECT north_money, trade_date FROM north_money_flow
+        ORDER BY trade_date DESC LIMIT 1
+    """).fetchone()
+    if row and row["north_money"] is not None:
+        return (row["north_money"], row["trade_date"])
+    return (None, None)
 
 
-def _get_north_money(conn, date):
-    """获取当日北向资金净流入"""
+def _get_limit_down(conn):
+    """获取最新跌停家数, 返回 (value, date)"""
     row = conn.execute("""
-        SELECT north_money FROM north_money_flow WHERE trade_date = ?
-    """, (date,)).fetchone()
-    return row["north_money"] if row else None
+        SELECT limit_down_count, trade_date FROM limit_down_stats
+        ORDER BY trade_date DESC LIMIT 1
+    """).fetchone()
+    if row and row["limit_down_count"] is not None:
+        return (row["limit_down_count"], row["trade_date"])
+    return (None, None)
 
 
-def _get_limit_down(conn, date):
-    """获取当日跌停家数"""
-    row = conn.execute("""
-        SELECT limit_down_count FROM limit_down_stats WHERE trade_date = ?
-    """, (date,)).fetchone()
-    return row["limit_down_count"] if row else None
-
-
-def _get_volume_ratio(conn, date):
-    """计算沪深300成交量较5日均量的比值"""
-    row = conn.execute("""
-        SELECT close, vol FROM index_daily
-        WHERE ts_code = '000300.SH' AND trade_date <= ?
+def _get_volume_ratio(conn):
+    """计算沪深300成交量较5日均量的比值, 返回 (value, date)"""
+    rows = conn.execute("""
+        SELECT close, vol, trade_date FROM index_daily
+        WHERE ts_code = '000300.SH'
         ORDER BY trade_date DESC LIMIT 6
-    """, (date,)).fetchall()
+    """).fetchall()
 
-    if len(row) < 6:
-        return None
+    if len(rows) < 6:
+        return (None, None)
 
-    current_vol = row[0]["vol"]
-    avg_vol = sum(r["vol"] for r in row[1:6]) / 5
-    return current_vol / avg_vol if avg_vol > 0 else None
+    current_vol = rows[0]["vol"]
+    vol_date = rows[0]["trade_date"]
+    avg_vol = sum(r["vol"] for r in rows[1:6]) / 5
+    ratio = current_vol / avg_vol if avg_vol > 0 else None
+    return (ratio, vol_date)
 
 
-def _save_panic_alert(conn, date, is_panic, triggered, details):
-    """保存恐慌预警记录"""
+def _save_panic_alert(conn, date, is_panic, triggered, details, dates=None):
+    """保存恐慌预警记录, dates为各指标各自的数据日期"""
     level = "PANIC" if is_panic else ("WARNING" if len(triggered) > 0 else "NORMAL")
+    dates = dates or {}
     conn.execute("""
         INSERT INTO panic_alerts (trade_date, alert_level, trigger_details,
-                                   hs300_pct_chg, north_money, limit_down_count, volume_ratio)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                   hs300_pct_chg, hs300_date,
+                                   north_money, north_date,
+                                   limit_down_count, limit_down_date,
+                                   volume_ratio, volume_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (date, level, "|".join(triggered),
-          details.get("hs300_pct_chg"), details.get("north_money"),
-          details.get("limit_down_count"), details.get("volume_ratio")))
+          details.get("hs300_pct_chg"), dates.get("hs300_date"),
+          details.get("north_money"), dates.get("north_date"),
+          details.get("limit_down_count"), dates.get("limit_down_date"),
+          details.get("volume_ratio"), dates.get("volume_date")))
     conn.commit()
 
 
@@ -521,11 +577,15 @@ def _check_ma_trend(ts_code, conn):
 
 
 def _calc_single_momentum(ts_code, conn):
-    """计算单只ETF的动量得分 (价格比法)
+    """计算单只ETF的动量得分 (价格比法) + MA20趋势状态
 
     与 etf_discovery.py / breakout_discovery.py 保持一致:
       n日动量 = 最新收盘价 / n日前收盘价 - 1
     直接用 close 价格计算, 避免 pct_chg 缺失导致的累乘误差。
+
+    返回额外字段:
+      ma20: 20日均线值
+      above_ma20: 最新收盘价是否在MA20上方 (买入闸门条件之一)
     """
     rows = conn.execute("""
         SELECT trade_date, close FROM index_daily
@@ -546,7 +606,16 @@ def _calc_single_momentum(ts_code, conn):
     # 中期动量: close[-1] / close[-(MEDIUM+1)] - 1
     momentum_60d = (closes[-1] / closes[-(MOMENTUM_MEDIUM + 1)] - 1) * 100.0
 
+    # MA20 趋势判断
+    ma20 = None
+    above_ma20 = False
+    if len(closes) >= 20:
+        ma20 = round(sum(closes[-20:]) / 20, 4)
+        above_ma20 = closes[-1] > ma20
+
     return {
         "momentum_20d": round(momentum_20d, 4),
-        "momentum_60d": round(momentum_60d, 4)
+        "momentum_60d": round(momentum_60d, 4),
+        "ma20": ma20,
+        "above_ma20": above_ma20,
     }
