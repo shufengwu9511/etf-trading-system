@@ -12,16 +12,26 @@ from config import (
     MOMENTUM_SHORT, MOMENTUM_MEDIUM, MOMENTUM_WEIGHT_SHORT, MOMENTUM_WEIGHT_MEDIUM,
     MOMENTUM_MIN_THRESHOLD,
     ROTATION_HOLD_COUNT, ROTATION_CYCLE_DAYS,
+    ROTATION_RANK_BUFFER, ROTATION_MAX_HOLD_COUNT,
     # 移动止盈 + 止损
     TRAILING_STOP_ACTIVATE, TRAILING_STOP_PULLBACK,
     TRAILING_STOP_PANIC_PULLBACK, TRAILING_STOP_TOP1_PULLBACK,
     STOP_LOSS_THRESHOLD, STOP_LOSS_PANIC_THRESHOLD, MIN_HOLD_DAYS,
     MA20_STOP_LOSS_RATIO,
+    # 宽基底仓专用 (兜底止损 + 减仓比例)
+    CORE_STOP_LOSS_THRESHOLD, CORE_STOP_LOSS_PANIC_THRESHOLD, CORE_REDUCE_RATIO,
+    MIN_TRADE_AMOUNT,
+    # 观察仓阈值
+    MIN_POSITION_VALUE,
+    # 执行纪律 (反摊平红线 + 卖出信号逾期回看)
+    ANTI_AVERAGING_LOSS_THRESHOLD,
+    SIGNAL_OVERDUE_LOOKBACK_DAYS, SIGNAL_OVERDUE_GRACE_DAYS,
     # 恐慌监控
-    PANIC_HS300_DROP, PANIC_NORTH_OUTFLOW, PANIC_LIMIT_DOWN_COUNT,
-    PANIC_VOLUME_RATIO, PANIC_TRIGGER_COUNT,
+    PANIC_HS300_DROP, PANIC_NORTH_OUTFLOW,
+    PANIC_NORTH_TURNOVER_RATIO, PANIC_NORTH_MA_DAYS,
+    PANIC_LIMIT_DOWN_COUNT, PANIC_VOLUME_RATIO, PANIC_TRIGGER_COUNT,
     # 标的
-    CORE_ETFS, SATELLITE_ETFS,
+    CORE_ETFS, SATELLITE_ETFS, preferred_buy_code,
     # 资金
     TOTAL_CAPITAL, SINGLE_ETF_MAX_RATIO,
 )
@@ -49,12 +59,17 @@ def check_panic_alert():
         if hs300_pct is not None and hs300_pct <= PANIC_HS300_DROP:
             triggered.append(f"沪深300跌幅{hs300_pct:.2f}% (阈值{PANIC_HS300_DROP:.1f}%)")
 
-        # 指标2: 北向资金净流出 (取最新可用数据)
-        north_money, north_date = _get_north_money(conn)
-        details["north_money"] = north_money
+        # 指标2: 北向成交额异动 (较近20日均值放大)
+        # 注: 原用 north_money 判净流出, 但该字段实为 hgt+sgt 成交流水(恒正),
+        #     判据永远不成立 → 指标失效。2024-08起净流入已停止披露, 改用成交额异动。
+        north_ratio, north_date = _get_north_turnover_ratio(conn)
+        details["north_turnover_ratio"] = north_ratio
         dates["north_date"] = north_date
-        if north_money is not None and north_money <= -PANIC_NORTH_OUTFLOW:
-            triggered.append(f"北向资金净流出{abs(north_money)/10000:.1f}亿 (阈值{PANIC_NORTH_OUTFLOW/10000:.0f}亿)")
+        if north_ratio is not None and north_ratio >= PANIC_NORTH_TURNOVER_RATIO:
+            triggered.append(
+                f"北向成交额放大{north_ratio:.2f}倍 "
+                f"(阈值{PANIC_NORTH_TURNOVER_RATIO:.1f}倍)"
+            )
 
         # 指标3: 跌停家数（AkShare, 当天盘中就有）
         limit_down, ld_date = _get_limit_down(conn)
@@ -135,42 +150,116 @@ def calc_pe_percentile(ts_code):
         conn.close()
 
 
-def check_core_etf_signals():
+def check_core_etf_signals(holdings=None):
     """
-    综合PE估值 + MA120趋势，输出宽基ETF信号
-    返回: list of signal dicts
+    综合PE估值 + MA100趋势，输出宽基ETF信号，并落地为"可执行动作"。
+
+    估值/趋势只决定"方向偏好"，真正能执行的动作必须结合当前持仓 (2026-10-14修正):
+      - 看多(PE低估 + 均线向上): 距目标仓位还差 > MIN_TRADE_AMOUNT → 建议申购差额；否则维持
+      - 看空(PE高估 或 均线向下): 有持仓 → 建议减仓 CORE_REDUCE_RATIO；无持仓 → 仅观望
+      - 中性: 维持当前仓位
+    修正原因: 原实现只看估值/趋势就报"🟡建议减仓 + 目标金额¥X"，其中目标金额其实是
+    "总资金×目标权重"(绝对目标仓位)，对空仓/低仓标的会产生方向错误的减仓提示
+    (例如未持有的中证500/科创50也天天被"建议减仓")。
+
+    返回: list of signal dicts (含 current_amount / target_amount / amount 落地金额)
     """
+    holdings = holdings or []
+
+    # 汇总当前宽基持仓市值 (在途申购按已投入金额计) + 市值加权浮亏
+    cur_map = {}
+    pnl_parts = {}
+    for h in holdings:
+        if h.get("category") != "core":
+            continue
+        code = h.get("etf_code")
+        if not code:
+            continue
+        if h.get("status") == "pending_buy":
+            val = h.get("total_cost") or 0
+        else:
+            val = h.get("market_value") or 0
+        cur_map[code] = (cur_map.get(code) or 0) + val
+        # 同一宽基可能分批建仓, 按市值加权汇总浮亏 (用于反摊平红线)
+        pnl_parts.setdefault(code, []).append((val, h.get("profit_pct") or 0))
+    pnl_map = {}
+    for code, parts in pnl_parts.items():
+        wsum = sum(v for v, _ in parts)
+        if wsum > 0:
+            pnl_map[code] = sum(v * p for v, p in parts) / wsum
+
     signals = []
     conn = get_connection()
 
     for etf in CORE_ETFS:
         pe_result = calc_pe_percentile(etf["code"])
 
-        # MA120趋势判断
+        # MA100趋势判断
         ma_signal = _check_ma_trend(etf["code"], conn)
 
-        # 综合信号
         pe_signal = pe_result["signal"]
         pct_str = f"{pe_result['percentile']:.0f}%" if pe_result["percentile"] is not None else ("N/A" if pe_result.get("reason") == "pe_data_missing" else "数据不足")
+
+        current_amount = round(cur_map.get(etf["code"], 0) or 0, 2)
+        target_amount = round(TOTAL_CAPITAL * etf["target_weight"], 2)
+
+        # --- 方向偏好 (估值 + 趋势) ---
         if pe_signal == "buy" and ma_signal == "up":
-            direction = "buy"
-            reason = f"PE低估({pct_str}) + 均线向上"
+            bias = "bullish"
+            bias_reason = f"PE低估({pct_str}) + 均线向上"
         elif pe_signal == "sell" or ma_signal == "down":
-            direction = "reduce"
-            reason = f"PE高估({pct_str})" if pe_signal == "sell" else "均线向下"
+            bias = "bearish"
+            bias_reason = f"PE高估({pct_str})" if pe_signal == "sell" else "均线向下(MA100)"
         else:
-            direction = "hold"
-            reason = f"PE中性({pct_str}), 均线{ma_signal}"
+            bias = "neutral"
+            bias_reason = f"PE中性({pct_str}), 均线{ma_signal}"
+
+        # --- 落地为可执行动作 (结合当前持仓) ---
+        if bias == "bullish":
+            gap = target_amount - current_amount
+            cur_pnl = pnl_map.get(etf["code"])
+            # 反摊平红线 (2026-10-23): 已有持仓且浮亏超红线时, 即使估值看多也不加仓
+            if gap > MIN_TRADE_AMOUNT and cur_pnl is not None and cur_pnl <= ANTI_AVERAGING_LOSS_THRESHOLD:
+                direction, amount = "hold", 0.0
+                reason = (f"{bias_reason}; 但现有持仓浮亏{cur_pnl:.2f}%已触及加仓红线"
+                          f"({ANTI_AVERAGING_LOSS_THRESHOLD:.0f}%), 暂不加仓 "
+                          f"(现持¥{current_amount:,.0f}/目标¥{target_amount:,.0f})")
+            elif gap > MIN_TRADE_AMOUNT:
+                direction, amount = "buy", round(gap, 2)
+                reason = (f"{bias_reason}; 现持¥{current_amount:,.0f}/目标¥{target_amount:,.0f}, "
+                          f"距目标仓位还差¥{gap:,.0f}")
+            else:
+                direction, amount = "hold", 0.0
+                reason = (f"{bias_reason}; 仓位已达目标 (现持¥{current_amount:,.0f}/目标¥{target_amount:,.0f})")
+        elif bias == "bearish":
+            if current_amount > 0:
+                direction = "reduce"
+                amount = round(current_amount * CORE_REDUCE_RATIO, 2)
+                reason = (f"{bias_reason}; 现持¥{current_amount:,.0f}, "
+                          f"建议减仓{CORE_REDUCE_RATIO:.0%} (约¥{amount:,.0f})")
+            else:
+                direction, amount = "hold", 0.0
+                reason = f"{bias_reason}; 当前无持仓, 暂时观望 (不建议新建仓)"
+        else:
+            direction, amount = "hold", 0.0
+            reason = (f"{bias_reason}; 维持当前仓位 (现持¥{current_amount:,.0f}/目标¥{target_amount:,.0f})")
 
         signals.append({
             "etf_code": etf["code"],
-            "fund_code": etf["fund_code"],
+            # 买入(新钱)用低费率份额代码; 减仓/持有必须指回实际持仓的 A 类老代码,
+            # 否则用户会拿着没有份额的代码去赎回
+            "fund_code": (preferred_buy_code(etf) if direction == "buy"
+                          else etf["fund_code"]),
             "name": etf["name"],
             "category": "core",
             "direction": direction,
+            "signal_bias": bias,
             "target_weight": etf["target_weight"],
             "pe_info": pe_result,
             "ma_signal": ma_signal,
+            "current_amount": current_amount,
+            "target_amount": target_amount,
+            "amount": amount,
             "reason": reason
         })
 
@@ -196,7 +285,7 @@ def calc_momentum_scores():
             score["etf_code"] = etf["code"]
             score["name"] = etf["name"]
             score["category"] = etf["category"]
-            score["fund_code"] = etf["fund_code"]
+            score["fund_code"] = preferred_buy_code(etf)
             results.append(score)
 
     if not results:
@@ -227,6 +316,65 @@ def calc_momentum_scores():
     return df
 
 
+def is_watch_only(h):
+    """
+    观察仓判定 (大树规则 2026-09-11):
+    市值低于 MIN_POSITION_VALUE 的持仓不参与任何信号计算 —— 不赎回、不补仓、不止盈止损。
+    这类仓位通常只剩几百元, 申赎一次的成本与精力不划算, 保留只为查看实际涨跌幅。
+
+    注意: 仅排除"信号", 持仓仍会显示在看板中(标注为观察仓)。
+    """
+    mv = h.get("market_value") or 0
+    # 在途申购(pending_buy)份额未确认, 市值记0, 按投入金额判断
+    if h.get("status") == "pending_buy":
+        mv = h.get("total_cost") or 0
+    return mv < MIN_POSITION_VALUE
+
+
+def is_anti_averaging_blocked(h):
+    """
+    反摊平红线判定 (2026-10-23新增):
+    已持仓浮亏达到 ANTI_AVERAGING_LOSS_THRESHOLD(-10%) 时, 禁止再买入/补仓。
+
+    为什么: 实证复盘显示, 半导体ETF在净值 3.10→2.14 的下跌区间被连续加仓17笔
+    共184万, 加权成本只从3.10摊到2.4761, 而净值跌到1.9695 —— 摊平只是把
+    仓位敞口放大, 亏损绝对额从6万滚到30万。真正的风险管理是止损, 不是加仓。
+
+    返回 True 表示该持仓已被红线拦住, 不应产生买入信号。
+    """
+    return (h.get("profit_pct") or 0) <= ANTI_AVERAGING_LOSS_THRESHOLD
+
+
+def _rotation_healthy(row):
+    """持仓是否"还升": 综合动量 > 0 且 收盘价在 MA20 上方。
+
+    用途 (2026-11-09 新增): ① 排名缓冲区内的持有保护
+                            ② 允许超额持仓(>基础3只)的前提
+    口径必须与 intraday_signal.py / backtest.py 保持一致。
+    """
+    if row is None:
+        return False
+    try:
+        return (float(row["composite_score"]) > MOMENTUM_MIN_THRESHOLD
+                and bool(row["above_ma20"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _all_satellite_healthy(holdings, momentum_df):
+    """超额买入前提: 所有有效卫星持仓(排除观察仓/在途申购)都还健康。"""
+    for h in holdings:
+        if h.get("category") != "satellite" or is_watch_only(h):
+            continue
+        if h.get("status") == "pending_buy":
+            continue  # 份额未确认, 资金已投入但无法判趋势, 视为健康
+        matches = momentum_df[momentum_df["etf_code"] == h.get("etf_code")]
+        row = matches.iloc[0] if not matches.empty else None
+        if not _rotation_healthy(row):
+            return False
+    return True
+
+
 def check_rotation_signals(holdings):
     """
     根据动量排名生成轮动信号
@@ -240,8 +388,13 @@ def check_rotation_signals(holdings):
     # 动量门槛过滤: 综合得分 <= 0 的ETF不纳入轮动
     eligible = momentum_df[momentum_df["composite_score"] > MOMENTUM_MIN_THRESHOLD].copy()
 
-    # MA20趋势闸门: 收盘价在MA20上方才允许买入 (趋势方向确认)
-    eligible = eligible[eligible["above_ma20"] == True] if "above_ma20" in eligible.columns else eligible
+    # 卖出判定TopN = 纯动量前N (用户规则: 卖出条件之"跌出Top3"中的Top3指动量排名)
+    # 注意: MA20只是买入侧闸门, 不能提前过滤进TopN, 否则会误伤"动量Top3内但当日收盘
+    #       跌破MA20"的持仓 (如黄金ETF动量#3却因MA20下方被误判跌出前N建议赎回)
+    top_n = eligible.head(ROTATION_HOLD_COUNT)
+    top_codes = set(top_n["etf_code"].tolist())
+    # 排名缓冲区: 持仓跌出 Top3 后, 仍在 Top(HOLD+BUFFER) 内且健康 → 继续持有不卖
+    buffer_limit = ROTATION_HOLD_COUNT + ROTATION_RANK_BUFFER
 
     if eligible.empty:
         # 所有ETF动量都不够, 没有新的买入信号
@@ -260,18 +413,41 @@ def check_rotation_signals(holdings):
                 })
         return {"buy": [], "sell": [], "hold": hold_signals, "momentum_df": momentum_df, "top_codes": top_codes}
 
-    top_n = eligible.head(ROTATION_HOLD_COUNT)
-    top_codes = set(top_n["etf_code"].tolist())
-
     current_codes = {h["etf_code"] for h in holdings if h["category"] == "satellite"}
 
     buy_signals = []
     sell_signals = []
     hold_signals = []
 
-    # 需要买入的: 排名靠前但未持有的
+    # 需要买入的: 动量Top3中未持有的 + MA20买入闸门
+    # (MA20为买入侧独立闸门: 收盘价须在MA20上方, 否则跳过——不买入趋势走弱标的)
+    # --- 新建仓数量约束 (2026-11-09) ---
+    # 基础目标 3 只; 允许短期超额至 ROTATION_MAX_HOLD_COUNT 只,
+    # 但前提是所有现有卫星持仓"动量>0 且 MA20上方"(都还升)。
+    # 解决"满3只 + 7天赎回费锁卖不掉 + Top3有新标的"的死锁, 又不至于无限扩张。
+    sat_count = sum(1 for h in holdings
+                    if h.get("category") == "satellite" and not is_watch_only(h))
+    all_healthy = _all_satellite_healthy(holdings, momentum_df)
+    if sat_count < ROTATION_HOLD_COUNT:
+        buy_slots = ROTATION_HOLD_COUNT - sat_count
+    elif sat_count < ROTATION_MAX_HOLD_COUNT and all_healthy:
+        buy_slots = ROTATION_MAX_HOLD_COUNT - sat_count
+    else:
+        buy_slots = 0
+        if sat_count >= ROTATION_MAX_HOLD_COUNT:
+            print(f"    [SKIP] 卫星持仓已达上限 {ROTATION_MAX_HOLD_COUNT} 只, 不再新增买入")
+        else:
+            print(f"    [SKIP] 卫星持仓 {sat_count} 只已超基础 {ROTATION_HOLD_COUNT} 只, "
+                  f"且有持仓动量/趋势转弱, 不超额买入")
+
     for _, row in top_n.iterrows():
+        if buy_slots <= 0:
+            break
         if row["etf_code"] not in current_codes:
+            if "above_ma20" in row.index and not row["above_ma20"]:
+                print(f"    [SKIP] {row['name']} 动量Top{ROTATION_HOLD_COUNT}但收盘在MA20下方, 不满足买入闸门")
+                continue
+            buy_slots -= 1
             buy_signals.append({
                 "etf_code": row["etf_code"],
                 "fund_code": row["fund_code"],
@@ -287,61 +463,110 @@ def check_rotation_signals(holdings):
 
     # 需要卖出的: 持有但排名靠后, 且持有满轮动周期
     for h in holdings:
+        # 在途申购 (pending_buy): 份额尚未确认, 不能参与止损/轮动卖出判定
+        if h.get("status") == "pending_buy":
+            continue
+        # 观察仓: 市值<MIN_POSITION_VALUE, 不赎回 (留作查看涨跌)
+        if is_watch_only(h):
+            continue
+
         if h["category"] == "satellite" and h["etf_code"] not in top_codes:
-            hold_days = h.get("hold_days", 0)
-            if hold_days < ROTATION_CYCLE_DAYS:
-                # 持有未满轮动周期, 暂不赎回, 加入持有列表
+            code = h["etf_code"]
+            matches = momentum_df[momentum_df["etf_code"] == code]
+            row = matches.iloc[0] if not matches.empty else None
+            healthy = _rotation_healthy(row)
+            rank = int(row["rank"]) if row is not None else 9999
+
+            # 缓冲区保护: 跌出Top3但仍在Top(HOLD+BUFFER)内, 且动量/趋势都还向上 → 不卖
+            if rank <= buffer_limit and healthy:
                 hold_signals.append({
-                    "etf_code": h["etf_code"],
+                    "etf_code": code,
                     "fund_code": h["fund_code"],
                     "name": h["name"],
                     "category": h["category"],
                     "direction": "hold",
-                    "reason": f"排名跌出前{ROTATION_HOLD_COUNT}, 但持有仅{hold_days}天 (需满{ROTATION_CYCLE_DAYS}天)"
+                    "reason": (f"动量第{rank}, 在Top{buffer_limit}缓冲区内"
+                               f"(跌出Top{ROTATION_HOLD_COUNT}不硬切), 动量>0且MA20上方, 继续持有")
+                })
+                continue
+
+            hold_days = h.get("hold_days", 0)
+            if hold_days < ROTATION_CYCLE_DAYS:
+                # 持有未满轮动周期, 暂不赎回, 加入持有列表
+                hold_signals.append({
+                    "etf_code": code,
+                    "fund_code": h["fund_code"],
+                    "name": h["name"],
+                    "category": h["category"],
+                    "direction": "hold",
+                    "reason": f"跌出Top{buffer_limit}缓冲区或动量/趋势转弱, 但持有仅{hold_days}天 (需满{ROTATION_CYCLE_DAYS}天)"
                 })
                 continue
             sell_signals.append({
-                "etf_code": h["etf_code"],
+                "etf_code": code,
                 "fund_code": h["fund_code"],
                 "name": h["name"],
                 "category": h["category"],
                 "direction": "sell",
-                "reason": "动量排名跌出前N",
+                "reason": (f"动量第{rank}, 跌出Top{buffer_limit}缓冲区"
+                           if rank > buffer_limit else "动量转负或跌破MA20"),
                 "profit_pct": h.get("profit_pct", 0),
                 "hold_days": hold_days
             })
 
     # 继续持有的 / 仓位不足需补仓的
     for h in holdings:
-        if h["category"] == "satellite" and h["etf_code"] in top_codes:
-            rank_row = top_n[top_n["etf_code"] == h["etf_code"]].iloc[0]
-            mv = h.get("market_value", 0)
-            # 目标仓位: 单只卫星ETF上限
-            target_mv = TOTAL_CAPITAL * SINGLE_ETF_MAX_RATIO
-            if mv < target_mv * 0.5:
-                # 仓位不足 (不到目标的一半), 生成补仓买入信号
-                buy_signals.append({
-                    "etf_code": h["etf_code"],
-                    "fund_code": h["fund_code"],
-                    "name": h["name"],
-                    "category": h["category"],
-                    "direction": "buy",
-                    "reason": f"动量排名第{rank_row['rank']}, 仓位不足(当前{mv:,.0f}元, 目标{target_mv:,.0f}元), 建议补仓",
-                    "momentum_20d": rank_row["momentum_20d"],
-                    "momentum_60d": rank_row["momentum_60d"],
-                    "composite_score": rank_row["composite_score"],
-                    "current_value": mv,
-                    "target_value": target_mv
-                })
-            else:
-                hold_signals.append({
-                    "etf_code": h["etf_code"],
-                    "fund_code": h["fund_code"],
-                    "name": h["name"],
-                    "category": h["category"],
-                    "direction": "hold",
-                    "reason": f"动量排名第{rank_row['rank']}, 继续持有"
-                })
+        if h["category"] != "satellite" or h["etf_code"] not in top_codes:
+            continue
+        # 观察仓: 市值<MIN_POSITION_VALUE, 不补仓 (避免为几百元仓位追加资金)
+        if is_watch_only(h):
+            continue
+        rank_row = top_n[top_n["etf_code"] == h["etf_code"]].iloc[0]
+
+        # 反摊平红线 (2026-10-23): 浮亏已超 -10% 的持仓禁止补仓,
+        # 避免"越跌越买"把仓位敞口放大 (半导体17笔摊平的历史教训)
+        if is_anti_averaging_blocked(h):
+            hold_signals.append({
+                "etf_code": h["etf_code"],
+                "fund_code": h["fund_code"],
+                "name": h["name"],
+                "category": h["category"],
+                "direction": "hold",
+                "reason": (f"动量排名第{rank_row['rank']}, 但浮亏{h.get('profit_pct', 0):.2f}%"
+                           f"已触及加仓红线({ANTI_AVERAGING_LOSS_THRESHOLD:.0f}%), 禁止摊平加仓")
+            })
+            continue
+
+        mv = h.get("market_value") or 0
+        # 在途申购 (pending_buy): 份额未确认, 市值记为0, 但资金已占用 → 按投入金额计仓位, 避免重复申购
+        if h.get("status") == "pending_buy":
+            mv = h.get("total_cost") or 0
+        # 目标仓位: 单只卫星ETF上限
+        target_mv = TOTAL_CAPITAL * SINGLE_ETF_MAX_RATIO
+        if mv < target_mv * 0.5:
+            # 仓位不足 (不到目标的一半), 生成补仓买入信号
+            buy_signals.append({
+                "etf_code": h["etf_code"],
+                "fund_code": h["fund_code"],
+                "name": h["name"],
+                "category": h["category"],
+                "direction": "buy",
+                "reason": f"动量排名第{rank_row['rank']}, 仓位不足(当前{mv:,.0f}元, 目标{target_mv:,.0f}元), 建议补仓",
+                "momentum_20d": rank_row["momentum_20d"],
+                "momentum_60d": rank_row["momentum_60d"],
+                "composite_score": rank_row["composite_score"],
+                "current_value": mv,
+                "target_value": target_mv
+            })
+        else:
+            hold_signals.append({
+                "etf_code": h["etf_code"],
+                "fund_code": h["fund_code"],
+                "name": h["name"],
+                "category": h["category"],
+                "direction": "hold",
+                "reason": f"动量排名第{rank_row['rank']}, 继续持有"
+            })
 
     return {"buy": buy_signals, "sell": sell_signals, "hold": hold_signals, "momentum_df": momentum_df, "top_codes": top_codes}
 
@@ -371,6 +596,13 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
     peak_updates = []
 
     for h in holdings:
+        # 在途申购 (pending_buy): 份额未确认, 市值0会被误算成-100%亏损而触发假止损
+        if h.get("status") == "pending_buy":
+            continue
+        # 观察仓: 市值<MIN_POSITION_VALUE, 不触发止盈止损 (留作查看涨跌)
+        if is_watch_only(h):
+            continue
+
         profit_pct = h.get("profit_pct", 0)
         hold_days = h.get("hold_days", 0)
 
@@ -378,8 +610,23 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
         if hold_days < MIN_HOLD_DAYS and profit_pct > 0:
             continue
 
-        # 宽基ETF跳过止盈 (由PE估值择时管理)
+        # 宽基ETF: 不做移动止盈/MA20趋势止损 (那套由PE估值+MA100趋势管理),
+        # 仅保留一条"超宽固定止损"兜底 (2026-10-14新增), 防止极端单边行情下底仓无底线拖累
         if h.get("category") == "core":
+            core_stop = abs(CORE_STOP_LOSS_PANIC_THRESHOLD if is_panic else CORE_STOP_LOSS_THRESHOLD)
+            if hold_days >= MIN_HOLD_DAYS and profit_pct <= -core_stop:
+                signals.append({
+                    "etf_code": h["etf_code"],
+                    "fund_code": h["fund_code"],
+                    "name": h["name"],
+                    "category": h["category"],
+                    "direction": "sell",
+                    "signal_type": "stop_loss",
+                    "reason": f"{'[恐慌加急] ' if is_panic else ''}宽基兜底止损: 亏损{abs(profit_pct):.2f}% (阈值-{core_stop:.0f}%)",
+                    "profit_pct": profit_pct,
+                    "sell_ratio": 1.0,
+                    "priority": "urgent" if is_panic else "high"
+                })
             continue
 
         # 确定此持仓的回撤阈值
@@ -463,6 +710,121 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
 
 
 # ============================================================
+# 模块5: 执行纪律检查 (卖出信号逾期)
+# ============================================================
+
+def check_unexecuted_signals(holdings=None, lookback_days=None, grace_days=None):
+    """
+    检查"已经报警、但至今没有执行赎回"的卖出信号 (2026-10-23新增)。
+
+    背景: 2026-09-14 之后连续26个交易日零交易, 同期趋势止损每天都在报警,
+    三只持仓从 ¥164.8万 拖到 ¥132.97万, 拖延成本约32万。
+    本函数把"不执行"这件事本身变成看板顶部的一条硬提醒。
+
+    判定口径:
+      1) 先取最近 lookback_days 个有卖出信号的交易日 → 筛出"当下仍在报警"的标的
+      2) 对每个标的, 从最新一条卖出信号往前回溯"连续报警段"的起点
+         (相邻两次信号之间不超过 2 个交易日视为连续; 一旦断档就停, 避免把
+          几个月前孤立出现过的信号也算进这一次的拖延)
+      3) 该连续段起点之后若已有卖出交易 → 视为已响应
+      4) 逾期交易日数 > grace_days 才算逾期 (信号当日/次日视为在办理)
+
+    返回: list[dict], 按逾期天数降序
+    """
+    lookback_days = lookback_days or SIGNAL_OVERDUE_LOOKBACK_DAYS
+    grace_days = SIGNAL_OVERDUE_GRACE_DAYS if grace_days is None else grace_days
+    conn = get_connection()
+
+    recent = conn.execute(
+        """SELECT DISTINCT signal_date FROM signals
+           WHERE direction = 'sell' ORDER BY signal_date DESC LIMIT ?""",
+        (lookback_days,)).fetchall()
+    if not recent:
+        conn.close()
+        return []
+    window_start = recent[-1]["signal_date"]
+    latest_signal_date = recent[0]["signal_date"]
+
+    active = conn.execute(
+        """SELECT fund_code, name, etf_code, MAX(signal_date) last_seen
+           FROM signals
+           WHERE direction = 'sell' AND signal_date >= ? AND fund_code IS NOT NULL
+             AND signal_type IN ('trend_stop', 'stop_loss', 'trailing_stop')
+           GROUP BY fund_code""",
+        (window_start,)).fetchall()
+
+    mv_map = {}
+    if holdings is None:
+        holdings = [dict(r) for r in conn.execute(
+            "SELECT * FROM portfolio WHERE status IN ('holding','pending_buy')")]
+    for h in holdings:
+        fc = h.get("fund_code")
+        if fc:
+            mv_map[fc] = (mv_map.get(fc) or 0) + (h.get("market_value") or 0)
+
+    result = []
+    for r in active:
+        fc = r["fund_code"]
+        mv = mv_map.get(fc, 0) or 0
+        # 已清仓 / 观察仓不提醒 (几百元的仓位本来就不值得动)
+        if mv < MIN_POSITION_VALUE:
+            continue
+
+        # 回溯"连续报警段"的起点 (从最新信号往前, 断档即止)
+        sig_dates = [x["signal_date"] for x in conn.execute(
+            """SELECT DISTINCT signal_date FROM signals
+               WHERE fund_code = ? AND direction = 'sell'
+                 AND signal_type IN ('trend_stop', 'stop_loss', 'trailing_stop')
+               ORDER BY signal_date""", (fc,)).fetchall()]
+        if not sig_dates:
+            continue
+        first = sig_dates[-1]
+        for d in reversed(sig_dates[:-1]):
+            if _count_trading_days(conn, d, first) <= 2:
+                first = d
+            else:
+                break
+
+        # 这段连续报警期间若有卖出成交, 说明已响应
+        last_sell = conn.execute(
+            """SELECT MAX(submit_date) d FROM trades
+               WHERE fund_code = ? AND trade_type = 'sell'""", (fc,)).fetchone()["d"]
+        if last_sell and last_sell >= first:
+            continue
+
+        days = _count_trading_days(conn, first, latest_signal_date)
+        if days <= grace_days:
+            continue
+        last = conn.execute(
+            """SELECT signal_date, signal_type, reason, name FROM signals
+               WHERE fund_code = ? AND direction = 'sell'
+                 AND signal_type IN ('trend_stop', 'stop_loss', 'trailing_stop')
+               ORDER BY id DESC LIMIT 1""", (fc,)).fetchone()
+        chg = _price_change_since(conn, r["etf_code"], first)
+        est = None
+        if chg is not None and chg > -100 and mv > 0:
+            # 若在信号日就卖出, 现在的现金会比当前持仓市值多出多少
+            est = round(mv * (1 / (1 + chg / 100) - 1), 2)
+        result.append({
+            "name": last["name"] if last else r["name"],
+            "fund_code": fc,
+            "etf_code": r["etf_code"],
+            "first_signal_date": first,
+            "last_signal_date": last["signal_date"] if last else first,
+            "days": days,
+            "signal_type": last["signal_type"] if last else "",
+            "reason": last["reason"] if last else "",
+            "price_change_pct": round(chg, 2) if chg is not None else None,
+            "market_value": mv,
+            "est_slippage": est,
+        })
+
+    conn.close()
+    result.sort(key=lambda x: (-x["days"], -(x["market_value"] or 0)))
+    return result
+
+
+# ============================================================
 # 内部辅助函数
 # ============================================================
 
@@ -487,6 +849,30 @@ def _get_latest_close_and_ma20(conn, ts_code, ma_period=20):
     return (closes[-1], round(sum(closes) / ma_period, 4))
 
 
+def _count_trading_days(conn, start_date, end_date):
+    """统计 (start_date, end_date] 之间的交易日数 (用 index_daily 的真实交易日历)"""
+    row = conn.execute(
+        """SELECT COUNT(DISTINCT trade_date) n FROM index_daily
+           WHERE trade_date > ? AND trade_date <= ?""",
+        (start_date, end_date)).fetchone()
+    return row["n"] if row and row["n"] else 0
+
+
+def _price_change_since(conn, etf_code, since_date):
+    """信号日之后该ETF场内价格的累计涨跌幅(%), 数据不足返回 None"""
+    if not etf_code:
+        return None
+    a = conn.execute(
+        """SELECT close FROM index_daily WHERE ts_code = ? AND trade_date >= ?
+           ORDER BY trade_date LIMIT 1""", (etf_code, since_date)).fetchone()
+    b = conn.execute(
+        """SELECT close FROM index_daily WHERE ts_code = ?
+           ORDER BY trade_date DESC LIMIT 1""", (etf_code,)).fetchone()
+    if a and b and a["close"]:
+        return (b["close"] / a["close"] - 1) * 100
+    return None
+
+
 def _get_hs300_pct_chg(conn):
     """获取沪深300最新交易日的涨跌幅, 返回 (value, date)"""
     row = conn.execute("""
@@ -500,7 +886,7 @@ def _get_hs300_pct_chg(conn):
 
 
 def _get_north_money(conn):
-    """获取最新交易日的北向资金��流入, 返回 (value, date)"""
+    """获取最新交易日的北向成交额 (注: 该字段实为 hgt+sgt 成交流水, 非净流入)"""
     row = conn.execute("""
         SELECT north_money, trade_date FROM north_money_flow
         ORDER BY trade_date DESC LIMIT 1
@@ -508,6 +894,33 @@ def _get_north_money(conn):
     if row and row["north_money"] is not None:
         return (row["north_money"], row["trade_date"])
     return (None, None)
+
+
+def _get_north_turnover_ratio(conn, ma_days=None):
+    """计算北向成交额异动倍数 = 最新成交额 / 近N日均值, 返回 (ratio, date)
+
+    north_money 实为 hgt+sgt 的成交流水(恒正), 无法表达"净流出";
+    2024-08起北向净流入已停止披露, 改用"成交额相对自身均值是否骤增"捕捉外资异动。
+    """
+    ma_days = ma_days or PANIC_NORTH_MA_DAYS
+    rows = conn.execute("""
+        SELECT north_money, trade_date FROM north_money_flow
+        WHERE north_money IS NOT NULL AND north_money > 0
+        ORDER BY trade_date DESC LIMIT ?
+    """, (ma_days + 1,)).fetchall()
+    if len(rows) < ma_days:
+        return (None, None)
+
+    latest = rows[0]["north_money"]
+    # rows[1:] 为除当日外的近N日, 用它们算均值 (避免当日值稀释分母)
+    history = [r["north_money"] for r in rows[1:ma_days + 1]]
+    if not history:
+        return (None, None)
+    avg = sum(history) / len(history)
+    if avg <= 0:
+        return (None, None)
+    return (latest / avg, rows[0]["trade_date"])
+
 
 
 def _get_limit_down(conn):
@@ -546,13 +959,14 @@ def _save_panic_alert(conn, date, is_panic, triggered, details, dates=None):
     conn.execute("""
         INSERT INTO panic_alerts (trade_date, alert_level, trigger_details,
                                    hs300_pct_chg, hs300_date,
-                                   north_money, north_date,
+                                   north_money, north_turnover_ratio, north_date,
                                    limit_down_count, limit_down_date,
                                    volume_ratio, volume_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (date, level, "|".join(triggered),
           details.get("hs300_pct_chg"), dates.get("hs300_date"),
-          details.get("north_money"), dates.get("north_date"),
+          details.get("north_money"), details.get("north_turnover_ratio"),
+          dates.get("north_date"),
           details.get("limit_down_count"), dates.get("limit_down_date"),
           details.get("volume_ratio"), dates.get("volume_date")))
     conn.commit()

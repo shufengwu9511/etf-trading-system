@@ -5,13 +5,23 @@
 # 联接基金净值 → AkShare fund_open_fund_info_em (保留)
 # 恐慌指标 → Tushare moneyflow_hsgt + AkShare 跌停统计 (保留)
 # ============================================================
+import os
 import tushare as ts
 import pandas as pd
 import time as _time
 from datetime import datetime, timedelta
 from db import get_connection
-from config import TUSHARE_TOKEN, CORE_ETFS, SATELLITE_ETFS
+from config import TUSHARE_TOKEN, CORE_ETFS, SATELLITE_ETFS, KLINE_SOURCE
 import tdx_data  # 通达信免费数据源 (ETF场内K线)
+
+# 运行环境(沙箱)会注入 HTTP_PROXY, 对 api.waditu.com 的连接不稳定
+# (间歇 ProxyError / ConnectionResetError: 远程主机强迫关闭连接) → 该域名强制直连
+# NO_PROXY 只影响这一个域名, 不动其他渠道的代理设置
+_no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+if "api.waditu.com" not in _no_proxy:
+    _merged = ",".join(x for x in (_no_proxy, "api.waditu.com") if x)
+    os.environ["NO_PROXY"] = _merged
+    os.environ["no_proxy"] = _merged
 
 # 初始化 Tushare（PE估值 + 北向资金 + 交易日历）
 pro = ts.pro_api(TUSHARE_TOKEN)
@@ -24,7 +34,14 @@ _RETRY_DELAY = 2  # 秒
 HS300_INDEX = "000300.SH"
 
 # 数据源标记
-USE_TDX_FOR_ETF_KLINE = True  # ETF场内K线使用通达信 (True) 或 Tushare (False)
+USE_TDX_FOR_ETF_KLINE = True  # ETF场内K线使用本地缓存源 (True) 或 Tushare (False)
+# 实际取数渠道由 config.KLINE_SOURCE 决定 (2026-10-23 起默认 新浪+xdxr),
+# 这个标签仅用于日志, 必须如实反映, 否则又会像原来那样把新浪数据标成通达信。
+_KLINE_LABEL = {
+    "sina": "新浪+xdxr复权",
+    "tdx": "通达信",
+    "auto": "新浪/通达信",
+}.get((KLINE_SOURCE or "sina").lower(), KLINE_SOURCE)
 
 
 def _get_date_range(days):
@@ -54,6 +71,9 @@ def _get_latest_trade_date():
 def _retry_api_call(api_func, label, **kwargs):
     """带重试的API调用，处理网络波动"""
     last_err = None
+    # 注意: 匹配用小写化后的文本, 否则 "ConnectionResetError"/"ProxyError" 会漏判
+    _RETRY_KEYWORDS = ("token", "connection", "timeout", "httperror", "proxy",
+                       "reset", "max retries", "1006", "502", "503")
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             return api_func(**kwargs)
@@ -61,7 +81,7 @@ def _retry_api_call(api_func, label, **kwargs):
             last_err = e
             err_msg = str(e)
             # 仅对网络/Token临时错误重试
-            if any(kw in err_msg for kw in ("token", "connection", "timeout", "HTTPError", "1006", "502", "503")):
+            if any(kw in err_msg.lower() for kw in _RETRY_KEYWORDS):
                 if attempt < _MAX_RETRIES:
                     print(f"    [RETRY {attempt}/{_MAX_RETRIES}] {label}: {err_msg[:80]}, 等待{_RETRY_DELAY}s...")
                     _time.sleep(_RETRY_DELAY)
@@ -189,7 +209,7 @@ def update_core_etf_data(etf_config, days=120):
         conn.commit()
 
     conn.close()
-    source = "通达信" if USE_TDX_FOR_ETF_KLINE else "Tushare"
+    source = _KLINE_LABEL if USE_TDX_FOR_ETF_KLINE else "Tushare"
     print(f"    [OK] {etf_config['name']} ({etf_code}) [{source}] 行情{total}条 + 估值{val_count}条")
     return total
 
@@ -225,7 +245,7 @@ def update_satellite_etf_data(etf_config, days=180):
         conn.commit()
 
     conn.close()
-    source = "通达信" if USE_TDX_FOR_ETF_KLINE else "Tushare"
+    source = _KLINE_LABEL if USE_TDX_FOR_ETF_KLINE else "Tushare"
     print(f"    [OK] {etf_config['name']} ({etf_code}) [{source}] 行情{count}条")
     return count
 
@@ -309,10 +329,23 @@ def run_full_data_update():
     """执行完整数据更新 (每日运行)"""
     print("=" * 60)
     print(f"[数据更新] 开始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  ETF场内K线: {'通达信 pytdx (免费)' if USE_TDX_FOR_ETF_KLINE else 'Tushare'}")
+    print(f"  ETF场内K线: {_KLINE_LABEL if USE_TDX_FOR_ETF_KLINE else 'Tushare'}")
     print(f"  PE估值/北向: Tushare Pro")
     print(f"  联接基金净值/跌停: AkShare")
     print("=" * 60)
+
+    # 0. 并行预取ETF场内K线 (2026-10-23 新增)
+    #    串行时单只 29.6s (pytdx 失效下 3 次重试各扫一遍服务器), 18 只要 9 分钟;
+    #    并行预取后下面的 update_core/satellite 直接命中本地缓存, 不再碰网络。
+    print("\n[0/4] 并行预取ETF场内K线...")
+    if USE_TDX_FOR_ETF_KLINE:
+        all_codes = [e["code"] for e in CORE_ETFS] + [e["code"] for e in SATELLITE_ETFS]
+        try:
+            tdx_data.prefetch_klines(all_codes, days=120)
+        except Exception as e:
+            print(f"  [WARN] K线预取失败 (后续按只兜底): {e}")
+    else:
+        print("  (当前配置使用 Tushare, 跳过)")
 
     # 1. 宽基ETF: 指数行情 + 估值
     print("\n[1/4] 更新宽基ETF数据 (行情+估值)...")

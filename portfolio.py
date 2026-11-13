@@ -7,6 +7,7 @@ import csv
 import pandas as pd
 from datetime import datetime, timedelta
 from db import get_connection
+from redeem_fee import calc_redeem_fee
 from config import (
     TOTAL_CAPITAL, CORE_RATIO, SATELLITE_RATIO,
     SINGLE_ETF_MAX_RATIO, MIN_TRADE_AMOUNT,
@@ -14,7 +15,59 @@ from config import (
     CORE_ETFS, SATELLITE_ETFS, MIN_HOLD_DAYS,
     TUSHARE_TOKEN, MOMENTUM_SHORT, MOMENTUM_MEDIUM,
     TRAILING_STOP_ACTIVATE,
+    CONCENTRATION_WARN_RATIO, CONCENTRATION_DANGER_RATIO,
+    ACCOUNT_CASH_FILE,
 )
+
+
+def check_concentration():
+    """检查单只持仓的集中度风险 (2026-09-03新增)
+
+    背景: SINGLE_ETF_MAX_RATIO 只约束单笔买入金额, 对累计持仓没有上限。
+    向下摊平(越跌越买)会把单只仓位堆到远超设计比例 (实测半导体曾达59%)。
+
+    返回: {"max_ratio": float, "total_mv": float, "alerts": [...]}
+      alerts 每项: {name, fund_code, market_value, ratio, level, excess_amount}
+      level: "danger"(>=25%) / "warn"(>=15%) / "ok"
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT fund_code, name, category, market_value, profit_pct
+            FROM portfolio WHERE status = 'holding'
+            ORDER BY market_value DESC
+        """).fetchall()
+    finally:
+        conn.close()
+
+    total_mv = sum((r["market_value"] or 0) for r in rows)
+    alerts = []
+    for r in rows:
+        mv = r["market_value"] or 0
+        ratio = mv / TOTAL_CAPITAL if TOTAL_CAPITAL else 0
+        if ratio >= CONCENTRATION_DANGER_RATIO:
+            level = "danger"
+        elif ratio >= CONCENTRATION_WARN_RATIO:
+            level = "warn"
+        else:
+            level = "ok"
+        if level != "ok":
+            alerts.append({
+                "fund_code": r["fund_code"],
+                "name": r["name"],
+                "category": r["category"],
+                "market_value": mv,
+                "ratio": ratio,
+                "level": level,
+                "profit_pct": r["profit_pct"],
+                # 减到预警线所需赎回金额
+                "excess_amount": max(mv - TOTAL_CAPITAL * CONCENTRATION_WARN_RATIO, 0),
+            })
+    return {
+        "max_ratio": (alerts[0]["ratio"] if alerts else 0),
+        "total_mv": total_mv,
+        "alerts": alerts,
+    }
 
 
 def _calc_confirm_date(submit_date_str):
@@ -50,18 +103,62 @@ def _calc_confirm_date(submit_date_str):
     return None
 
 
-def _calc_hold_days(confirm_date_str):
+def _calc_hold_days(confirm_date_str, asof=None):
     """
-    根据份额确认日期计算持有天数(自然日)
-    赎回费按自然日计算, 所以这里也用自然日
+    计算「若今日提交赎回」时的份额持有天数 (自然日, 含确认日当天)。
+
+    官方口径 (易方达客服 + 证监会深圳监管局《关注交易规则,避免7天高赎回费》):
+      持有时间 = 申购确认日(含) ~ 赎回确认日前一个自然日(含), 按自然日计,
+      含节假日周末; 满 7 天免 1.5% 惩罚赎回费。
+      等价写法: 持有时间 = 赎回确认日 - 申购确认日。
+    场外 T日提交赎回 → T+1交易日确认, 故以 today+1 作赎回确认日的保守下界
+    (遇周末/节假日顺延只会更长, 不会误判成可卖), 于是:
+      持有天数 = (today - 申购确认日).days + 1
+
+    🔴 2026-11-12 修正 off-by-one: 旧实现直接返回 (today - confirm).days,
+    把「今天」当成持有期终点, 漏掉确认日当天与 T+1 赎回确认日, 少算 1 天,
+    导致所有持仓的赎回费解锁日被推迟一天。实例: 创新药 019666 于 11-06 确认,
+    11-12 提交赎回 → 11-13 赎回确认 → 持有 11-06~11-12 共 7 天,
+    免 1.5% 惩罚赎回费(注意: 7-364 天仍按费率表收 0.5%, 并非免费);
+    旧逻辑却要等到 11-13 才解锁。
+    注: 旧数据无 confirm_date 时回退用 buy_date 且不加 1, 恰好等价于
+    「申购申请日 + 1 = 确认日」的假设, 本来就是对的; 错的只有这个主分支。
     """
     if not confirm_date_str:
         return 0
     try:
-        confirm = datetime.strptime(confirm_date_str, "%Y%m%d")
-        return (datetime.now() - confirm).days
+        confirm = datetime.strptime(str(confirm_date_str).replace("-", ""), "%Y%m%d")
+        # asof 用于补录历史赎回: 按提交日而非今天算持有期
+        if asof is None:
+            base = datetime.now()
+        elif isinstance(asof, str):
+            base = datetime.strptime(asof.replace("-", ""), "%Y%m%d")
+        elif isinstance(asof, datetime):
+            base = asof
+        else:
+            base = datetime.combine(asof, datetime.min.time())
+        # 在途申购的 confirm_date 是未来日期(如周五申购→下周一确认), 不能显示负数
+        return max(0, (base - confirm).days + 1)
     except Exception:
         return 0
+
+
+def _redeem_fee_for(h, submit_date, gross_amount, fee_override=None):
+    """按持仓确认日 + 赎回提交日计算赎回费(与 _calc_hold_days 同口径)。"""
+    conf = h.get("confirm_date") or h.get("buy_date")
+    asof = submit_date or datetime.now().strftime("%Y%m%d")
+    days = _calc_hold_days(conf, asof=asof)
+    return calc_redeem_fee(h["fund_code"], days, gross_amount, fee_override=fee_override)
+
+
+def _print_fee(fee_info):
+    """赎回费告警/明细输出"""
+    if not fee_info["verified"]:
+        print(f"     {fee_info['note']}")
+        return "[赎回费率未核实] "
+    if fee_info["fee"] > 0:
+        print(f"     赎回费: ¥{fee_info['fee']:,.2f} ({fee_info['note']}) → 净到账 ¥{fee_info['net']:,.2f}")
+    return f"[赎回费¥{fee_info['fee']:,.2f} / {fee_info['note']}] "
 
 
 def _get_etf_info_by_code(etf_code):
@@ -78,14 +175,16 @@ def _get_etf_info_by_code(etf_code):
 
 def _get_etf_info_by_fund_code(fund_code):
     """
-    根据联接基金代码查找对应的配置信息
+    根据联接基金代码查找对应的配置信息(含低费率替代份额代码)
     返回: {"name", "category", "etf_code", "fund_code"} 或 None
     """
-    for etf in CORE_ETFS + SATELLITE_ETFS:
-        if etf["fund_code"] == fund_code:
-            return {"name": etf["name"], "category": "core" if etf in CORE_ETFS else "satellite",
-                    "etf_code": etf["code"], "fund_code": etf["fund_code"]}
-    return None
+    from config import find_etf_by_fund_code, fund_display_name
+    info = find_etf_by_fund_code(fund_code)
+    if not info:
+        return None
+    # fund_code 用实际申购代码, 便于同一标的老仓/新份额各自独立记账
+    return {"name": fund_display_name(fund_code), "category": info["category"],
+            "etf_code": info["code"], "fund_code": str(fund_code)}
 
 
 # ============================================================
@@ -120,10 +219,31 @@ def get_current_holdings():
     return holdings
 
 
+def get_cash_balance():
+    """读取账户真实现金 (货币基金 000621 余额)
+
+    由 scripts/efunds_sync.py 从易方达资产页抓取后写入 data/account_cash.json。
+    读不到则返回 None, 调用方回落到「总资金 - 市值」的旧推算方式。
+    """
+    try:
+        with open(ACCOUNT_CASH_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        val = data.get("cash")
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
 def get_available_cash():
     """
     计算可用现金
-    = 总资金 - 持仓市值 - 在途申购金额
+
+    优先级:
+      1. data/account_cash.json 里的真实现金 (平台口径, 唯一准确来源)
+      2. 回落: 总资金 - 持仓市值 - 在途申购金额
+
+    注意: 旧算法(2)把累计亏损当成了可用现金。账户权益从 200万 跌到 159万时,
+    它会虚高 40 万以上。有平台数据时一律用(1)。
     """
     conn = get_connection()
     row = conn.execute("""
@@ -136,6 +256,13 @@ def get_available_cash():
 
     invested = row["invested"] if row["invested"] else 0
     pending_buy = row["pending_buy"] if row["pending_buy"] else 0
+
+    real_cash = get_cash_balance()
+    if real_cash is not None:
+        # 平台现金余额是"已到账"口径, 在途申购的钱已经划走、在途赎回的钱还没到账,
+        # 这里不再重复扣减 pending_buy (平台上它已不在现金余额里)
+        return max(real_cash, 0)
+
     available = TOTAL_CAPITAL - invested - pending_buy
     return max(available, 0)
 
@@ -317,7 +444,7 @@ def update_holdings_nav():
     """
     conn = get_connection()
     holdings = conn.execute("""
-        SELECT id, fund_code, etf_code, name, shares, cost_nav, total_cost, status
+        SELECT id, fund_code, etf_code, name, shares, cost_nav, total_cost, status, nav_date
         FROM portfolio WHERE status IN ('holding', 'pending_buy')
     """).fetchall()
 
@@ -338,11 +465,28 @@ def update_holdings_nav():
             continue
 
         current_nav, nav_date = result
+        # 统一日期格式为 YYYYMMDD 再比较:
+        #   AkShare 返回 '2026-11-06', 库内历史值是 '20261105', 直接字符串比较时
+        #   '-'(0x2D) < '1'(0x31) 会把新净值误判成旧数据而 SKIP, 导致净值永远不更新
+        nav_date = (nav_date or "").replace("-", "").strip()
+        old_nav_date = (h["nav_date"] or "").replace("-", "").strip()
+        # 防倒退: AkShare 净值常滞后(当天只出部分基金), 若抓到的日期早于库里的, 保留库里更新的值
+        # 背景(2026-11-05): 平台已公布 11-05 净值, 但 AkShare 仅更新了 1 只, 跑 main.py 会把其余倒退回 11-04
+        if old_nav_date and nav_date and nav_date < old_nav_date:
+            print(f"  [SKIP] {name}: AkShare 净值日期 {nav_date} 早于库内 {old_nav_date}, 保留现值")
+            continue
         shares = h["shares"]
         total_cost = h["total_cost"]
-        market_value = shares * current_nav
-        profit_loss = market_value - total_cost
-        profit_pct = (profit_loss / total_cost * 100) if total_cost > 0 else 0
+        if h["status"] == "pending_buy" and not shares:
+            # 申购在途: 份额未确认, 按投入金额计市值, 不产生盈亏
+            # (否则 shares=0 会算出市值 0 / 亏损 -100%, 看板严重误导)
+            market_value = total_cost
+            profit_loss = 0.0
+            profit_pct = 0.0
+        else:
+            market_value = shares * current_nav
+            profit_loss = market_value - total_cost
+            profit_pct = (profit_loss / total_cost * 100) if total_cost > 0 else 0
 
         conn.execute("""
             UPDATE portfolio
@@ -364,10 +508,11 @@ def update_holdings_nav():
 # 持仓卖出 (标记赎回)
 # ============================================================
 
-def sell_holding(fund_code, submit_date=None, confirm_date=None):
+def sell_holding(fund_code, submit_date=None, confirm_date=None, fee=None):
     """
     标记某只基金为已赎回, 记录交易日志
     fund_code: 联接基金代码
+    fee: 平台实际赎回费(可选); 不传则按 redeem_fee 费率表自动扣费
     """
     conn = get_connection()
     row = conn.execute("""
@@ -404,6 +549,9 @@ def sell_holding(fund_code, submit_date=None, confirm_date=None):
     if submit_date is None:
         submit_date = h.get("buy_date") or confirm_date
     sell_amount = h["market_value"]
+    fee_info = _redeem_fee_for(h, submit_date, sell_amount, fee_override=fee)
+    fee_tag = _print_fee(fee_info)
+    net_amount = float(fee_info["net"])
 
     # 更新状态
     conn.execute("""
@@ -416,12 +564,11 @@ def sell_holding(fund_code, submit_date=None, confirm_date=None):
     conn.execute("""
         INSERT INTO trades (fund_code, etf_code, name, trade_type, amount, shares, nav, fee,
                            status, submit_date, confirm_date, settle_date, signal_source, remark)
-        VALUES (?, ?, ?, 'sell', ?, ?, ?, 0, 'done', ?, ?, ?, 'manual',
-                ?)
+        VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, 'done', ?, ?, ?, 'manual', ?)
     """, (h["fund_code"], h["etf_code"], h["name"],
-          round(sell_amount, 2), h["shares"], h["current_nav"],
+          net_amount, h["shares"], h["current_nav"], float(fee_info["fee"]),
           h["buy_date"] or confirm_date, confirm_date, None,
-          f"手动赎回: 成本¥{h['total_cost']:,.0f}, 市值¥{sell_amount:,.0f}, 盈亏{h['profit_pct']:+.2f}%"))
+          f"{fee_tag}手动赎回: 成本¥{h['total_cost']:,.0f}, 毛额¥{sell_amount:,.2f}, 盈亏{h['profit_pct']:+.2f}%"))
 
     conn.commit()
     conn.close()
@@ -429,7 +576,7 @@ def sell_holding(fund_code, submit_date=None, confirm_date=None):
     emoji = "🟢" if h["profit_pct"] >= 0 else "🔴"
     print(f"  {emoji} {h['name']} ({fund_code}) 已标记为赎回")
     print(f"     份额: {h['shares']}份  成本净值: {h['cost_nav']}  当前净值: {h['current_nav']}")
-    print(f"     成本: ¥{h['total_cost']:,.0f}  市值: ¥{sell_amount:,.0f}  盈亏: {h['profit_pct']:+.2f}%")
+    print(f"     成本: ¥{h['total_cost']:,.0f}  毛额: ¥{sell_amount:,.2f}  净到账: ¥{net_amount:,.2f}  盈亏: {h['profit_pct']:+.2f}%")
     return True
 
 
@@ -784,7 +931,14 @@ def generate_action_sheet(signals_result, panic_alert, position_sizes):
             direction_map = {"buy": "🟢 建议申购", "sell": "🔴 建议赎回", "hold": "⚪ 维持不变", "reduce": "🟡 建议减仓"}
             lines.append(f"  {direction_map.get(sig['direction'], sig['direction'])}  {sig['name']}")
             lines.append(f"     联接基金代码: {sig.get('fund_code','待确认')}")
-            lines.append(f"     目标金额: ¥{sig.get('target_amount',0):,.0f}")
+            cur = sig.get("current_amount")
+            tgt = sig.get("target_amount")
+            if cur is not None:
+                lines.append(f"     当前持仓: ¥{cur:,.0f}   目标仓位: ¥{tgt:,.0f}")
+            amt = sig.get("amount") or 0
+            if amt > 0:
+                verb = "建议申购" if sig.get("direction") == "buy" else ("建议减仓" if sig.get("direction") == "reduce" else "建议金额")
+                lines.append(f"     {verb}: ¥{amt:,.0f}")
             lines.append(f"     逻辑: {sig.get('reason','')}")
             lines.append("")
 
@@ -826,6 +980,29 @@ def generate_action_sheet(signals_result, panic_alert, position_sizes):
                 lines.append(f"    → {sig['name']} ({sig.get('fund_code','待确认')})")
                 lines.append(f"      状态: {can_sell}  原因: {sig.get('reason','')}")
 
+    # 集中度风控
+    conc = check_concentration()
+    if conc["alerts"]:
+        lines.append("")
+        lines.append("-" * 70)
+        lines.append("  🎯 集中度风控")
+        lines.append("-" * 70)
+        for a in conc["alerts"]:
+            icon = "🔴" if a["level"] == "danger" else "🟡"
+            tag = "危险" if a["level"] == "danger" else "预警"
+            lines.append(
+                f"  {icon} {tag} {a['name']} ({a['fund_code']}): "
+                f"占总资金 {a['ratio']*100:.1f}%  "
+                f"(预警线{CONCENTRATION_WARN_RATIO*100:.0f}% / "
+                f"危险线{CONCENTRATION_DANGER_RATIO*100:.0f}%)"
+            )
+            lines.append(
+                f"      市值 ¥{a['market_value']:,.0f}, 盈亏 {a['profit_pct']:+.2f}%"
+                f"  → 减至预警线需赎回 ¥{a['excess_amount']:,.0f}"
+            )
+        lines.append("  注: SINGLE_ETF_MAX_RATIO 只约束单笔买入金额, 对累计持仓无上限;")
+        lines.append("      向下摊平会持续推高集中度, 此处仅提示, 由人工决定是否减仓。")
+
     # 资金概览
     lines.append("")
     lines.append("-" * 70)
@@ -841,7 +1018,7 @@ def generate_action_sheet(signals_result, panic_alert, position_sizes):
     lines.append("  ⚠️ 执行前请确认:")
     lines.append("  □ 今日无重大国际/国内突发事件")
     lines.append("  □ 已阅读信号原因并认可操作逻辑")
-    lines.append("  □ 赎回操作确认持有超过7天 (避免惩罚赎回费)")
+    lines.append("  □ 赎回操作确认持有满7天 (避开1.5%惩罚费; 多数A类7-364天仍收0.5%, 见 redeem_fee.py)")
     lines.append(f"  □ 将在14:30前完成申赎操作")
     lines.append("=" * 70)
 
@@ -874,13 +1051,18 @@ def save_signals_to_db(signals_result, panic_alert):
 
 def _insert_signal(conn, date, signal_type, sig, priority="normal"):
     """插入单条信号记录"""
+    # 落地建议金额: 优先取 sig["amount"] (宽基信号已按当前持仓算好),
+    # 否则回退到 target_amount (行业卫星申购由 calc_position_sizes 填充)
+    amount_val = sig.get("amount")
+    if amount_val is None:
+        amount_val = sig.get("target_amount")
     conn.execute("""
         INSERT INTO signals (signal_date, signal_type, etf_code, fund_code, name,
                             category, direction, amount, reason, priority)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (date, signal_type, sig["etf_code"], sig.get("fund_code"), sig["name"],
           sig.get("category", ""), sig.get("direction", ""),
-          sig.get("target_amount"), sig.get("reason", ""), priority))
+          amount_val, sig.get("reason", ""), priority))
 
 
 # ============================================================
@@ -933,8 +1115,8 @@ def buy_new_holding(fund_code, amount, etf_code=None, name=None, category="satel
         INSERT INTO portfolio (fund_code, etf_code, name, category, shares, cost_nav,
                               current_nav, total_cost, market_value, profit_loss, profit_pct,
                               status, buy_date, confirm_date, buy_amount)
-        VALUES (?, ?, ?, ?, 0, 0, 0, ?, 0, 0, 0, 'pending_buy', ?, ?, ?)
-    """, (fund_code, etf_code, name, category, amount, buy_date, confirm_date, amount))
+        VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, 0, 0, 'pending_buy', ?, ?, ?)
+    """, (fund_code, etf_code, name, category, amount, amount, buy_date, confirm_date, amount))
 
     # 记录交易
     conn.execute("""
@@ -1022,7 +1204,7 @@ def confirm_buy(fund_code, shares, nav, confirm_date=None):
 # 部分赎回
 # ============================================================
 
-def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, confirm_date=None):
+def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, confirm_date=None, fee=None):
     """
     赎回持仓 (支持部分赎回)
     参数二选一:
@@ -1040,20 +1222,18 @@ def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, c
     """, (fund_code,)).fetchone()
 
     if not row:
-        conn.close()
         candidates = conn.execute("""
             SELECT fund_code, name FROM portfolio
             WHERE status IN ('holding', 'pending_buy')
               AND (fund_code LIKE ? OR name LIKE ?)
-        """, (f"%{fund_code}%", f"%{fund_code}%")).fetchall() if not conn.closed else []
+        """, (f"%{fund_code}%", f"%{fund_code}%")).fetchall()
+        conn.close()
         if candidates:
             print(f"  未找到精确匹配, 相似结果:")
             for c in candidates:
                 print(f"    - {c['name']} ({c['fund_code']})")
         else:
             print(f"  [ERROR] 未找到基金 {fund_code} 的持仓记录")
-        conn = get_connection()
-        conn.close()
         return False
 
     h = dict(row)
@@ -1089,7 +1269,10 @@ def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, c
         sell_shares = total_shares
         actual_ratio = 1.0
 
-    sell_amount = sell_shares * h["current_nav"]
+    gross_amount = sell_shares * h["current_nav"]
+    fee_info = _redeem_fee_for(h, submit_date, gross_amount, fee_override=fee)
+    fee_tag = _print_fee(fee_info)
+    sell_amount = float(fee_info["net"])   # trades.amount 存净到账, 毛额另记于 remark
     sell_cost = h["total_cost"] * actual_ratio
     sell_profit = sell_amount - sell_cost
 
@@ -1103,16 +1286,16 @@ def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, c
         conn.execute("""
             INSERT INTO trades (fund_code, etf_code, name, trade_type, amount, shares, nav, fee,
                                status, submit_date, confirm_date, settle_date, signal_source, remark)
-            VALUES (?, ?, ?, 'sell', ?, ?, ?, 0, 'done', ?, ?, ?, 'manual', ?)
+            VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, 'done', ?, ?, ?, 'manual', ?)
         """, (h["fund_code"], h["etf_code"], h["name"],
-              round(sell_amount, 2), h["shares"], h["current_nav"],
+              round(sell_amount, 2), h["shares"], h["current_nav"], float(fee_info["fee"]),
               submit_date, confirm_date, None,
-              f"手动赎回: 成本¥{h['total_cost']:,.0f}, 市值¥{sell_amount:,.0f}, 盈亏{h['profit_pct']:+.2f}%"))
+              f"{fee_tag}手动赎回: 成本¥{h['total_cost']:,.0f}, 毛额¥{gross_amount:,.2f}, 盈亏{h['profit_pct']:+.2f}%"))
 
         emoji = "🟢" if h["profit_pct"] >= 0 else "🔴"
         print(f"  {emoji} {h['name']} ({fund_code}) 已全部赎回")
         print(f"     份额: {h['shares']}份  成本净值: {h['cost_nav']}  当前净值: {h['current_nav']}")
-        print(f"     成本: ¥{h['total_cost']:,.0f}  市值: ¥{sell_amount:,.0f}  盈亏: {h['profit_pct']:+.2f}%")
+        print(f"     成本: ¥{h['total_cost']:,.0f}  毛额: ¥{gross_amount:,.2f}  净到账: ¥{sell_amount:,.2f}  盈亏: {h['profit_pct']:+.2f}%")
 
     else:
         # 部分赎回: 减少份额和成本
@@ -1135,15 +1318,15 @@ def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, c
         conn.execute("""
             INSERT INTO trades (fund_code, etf_code, name, trade_type, amount, shares, nav, fee,
                                status, submit_date, confirm_date, settle_date, signal_source, remark)
-            VALUES (?, ?, ?, 'sell', ?, ?, ?, 0, 'done', ?, ?, ?, 'manual', ?)
+            VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, 'done', ?, ?, ?, 'manual', ?)
         """, (h["fund_code"], h["etf_code"], h["name"],
-              round(sell_amount, 2), sell_shares, h["current_nav"],
+              round(sell_amount, 2), sell_shares, h["current_nav"], float(fee_info["fee"]),
               submit_date, confirm_date, None,
-              f"部分赎回({actual_ratio:.1%}): {sell_shares:.2f}份, ¥{sell_amount:,.0f}, 盈亏¥{sell_profit:+,.0f}"))
+              f"{fee_tag}部分赎回({actual_ratio:.1%}): {sell_shares:.2f}份, 毛额¥{gross_amount:,.2f}, 盈亏¥{sell_profit:+,.2f}"))
 
         emoji = "🟢" if sell_profit >= 0 else "🔴"
         print(f"  {emoji} {h['name']} ({fund_code}) 部分赎回完成")
-        print(f"     赎回份额: {sell_shares:.2f}份  赎回金额: ¥{sell_amount:,.0f}  盈亏: ¥{sell_profit:+,.0f}")
+        print(f"     赎回份额: {sell_shares:.2f}份  毛额: ¥{gross_amount:,.2f}  净到账: ¥{sell_amount:,.2f}  盈亏: ¥{sell_profit:+,.2f}")
         print(f"     剩余份额: {new_shares:.2f}份  剩余市值: ¥{new_market_value:,.0f}")
 
     conn.commit()

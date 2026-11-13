@@ -23,10 +23,37 @@ from config import (
     MOMENTUM_SHORT, MOMENTUM_MEDIUM, MOMENTUM_WEIGHT_SHORT, MOMENTUM_WEIGHT_MEDIUM,
     MOMENTUM_MIN_THRESHOLD,
     ROTATION_HOLD_COUNT, ROTATION_CYCLE_DAYS,
+    ROTATION_RANK_BUFFER, ROTATION_MAX_HOLD_COUNT,
     STOP_LOSS_THRESHOLD, STOP_LOSS_PANIC_THRESHOLD, MIN_HOLD_DAYS,
     TRAILING_STOP_ACTIVATE, TRAILING_STOP_PULLBACK,
     TRAILING_STOP_PANIC_PULLBACK, TRAILING_STOP_TOP1_PULLBACK,
+    MA20_STOP_LOSS_RATIO,
 )
+
+# MA20 防守规则 (2026-08新增) 在回测中的开关
+#   实盘 strategy.py 已启用: 买入闸门(收盘>MA20) + 趋势止损(收盘<MA20×0.95)
+#   回测默认同步开启; 设环境变量 BT_MA20_RULES=0 可关闭, 用于 A/B 对比
+MA20_WINDOW = 20
+BT_MA20_RULES = os.environ.get("BT_MA20_RULES", "1") != "0"
+
+# 单只卫星ETF建仓金额上限 (占总资金比例), None = 不限额(老口径)
+#   实盘 strategy/portfolio 用 SINGLE_ETF_MAX_RATIO(当前 12%) 约束单笔买入,
+#   而回测原先按 sat_amount/ROTATION_HOLD_COUNT 直接满配, 没有这个约束。
+#   结果: 60%卫星+3只 时回测假设每只40万, 实盘单笔封顶16万 → 回测高估收益。
+#   用到本开关的脚本把 BT_SINGLE_MAX_RATIO 设成实盘值即可对齐执行口径。
+BT_SINGLE_MAX_RATIO = None
+
+# 排名缓冲区 + 超额持仓 (2026-11-09 新增, 与实盘 strategy/intraday_signal 同步)
+#   设 BT_ROTATION_BUFFER=0 可切回旧口径(跌出Top3就卖、持仓恒为3只)做 A/B 对比
+BT_ROTATION_BUFFER = os.environ.get("BT_ROTATION_BUFFER", "1") != "0"
+
+
+def _sat_per_etf(sat_amount):
+    """单只卫星的目标建仓金额 (受 BT_SINGLE_MAX_RATIO 约束)"""
+    per = sat_amount / ROTATION_HOLD_COUNT
+    if BT_SINGLE_MAX_RATIO:
+        per = min(per, TOTAL_CAPITAL * BT_SINGLE_MAX_RATIO)
+    return per
 
 
 # ============================================================
@@ -145,6 +172,19 @@ def calc_momentum_bt(ts_code, current_date, prices):
 
     composite = m20 * MOMENTUM_WEIGHT_SHORT + m60 * MOMENTUM_WEIGHT_MEDIUM
     return {"momentum_20d": m20, "momentum_60d": m60, "composite": composite}
+
+
+def calc_ma20_bt(ts_code, current_date, prices, window=MA20_WINDOW):
+    """计算MA20均线值 (回测版 — 与 strategy._calc_single_momentum 一致)
+
+    返回 MA20 浮点数; 历史数据不足则返回 None
+    """
+    price_list = prices.get(ts_code, [])
+    valid = [p for p in price_list if p["date"] <= current_date]
+    if len(valid) < window:
+        return None
+    closes = [p["close"] for p in valid[-window:]]
+    return sum(closes) / len(closes)
 
 
 # ============================================================
@@ -306,12 +346,23 @@ class BacktestEngine:
                 momentum_scores.append((etf, score))
         momentum_scores.sort(key=lambda x: x[1]["composite"], reverse=True)
 
-        per_sat = sat_amount / ROTATION_HOLD_COUNT
-        for etf, score in momentum_scores[:ROTATION_HOLD_COUNT]:
+        per_sat = _sat_per_etf(sat_amount)
+        built_count = 0
+        for idx, (etf, score) in enumerate(momentum_scores):
+            if built_count >= ROTATION_HOLD_COUNT:
+                break
             price = self._get_price(etf["code"], first_date)
-            if price:
-                self._buy_etf(etf["name"], etf["code"], per_sat, first_date, "satellite")
-                print(f"  买入 {etf['name']}: ¥{per_sat:,.0f} @ {price:.4f} (动量#{momentum_scores.index((etf, score))+1})")
+            if not price:
+                continue
+            # 买入闸门: 收盘价需在MA20上方 (与实盘一致)
+            if BT_MA20_RULES:
+                ma20 = calc_ma20_bt(etf["code"], first_date, self.prices)
+                if ma20 is not None and price <= ma20:
+                    print(f"  [SKIP] {etf['name']} 动量Top{ROTATION_HOLD_COUNT}但收盘在MA20下方 ({price:.4f} <= {ma20:.4f})")
+                    continue
+            self._buy_etf(etf["name"], etf["code"], per_sat, first_date, "satellite")
+            print(f"  买入 {etf['name']}: ¥{per_sat:,.0f} @ {price:.4f} (动量#{idx + 1})")
+            built_count += 1
 
         print(f"  建仓后现金: ¥{self.cash:,.0f}")
         print()
@@ -346,7 +397,7 @@ class BacktestEngine:
                 pnl_pct = (price / h["cost_nav"] - 1) * 100
                 hold_days = self._date_diff(date, h["buy_date"])
 
-                # 最短持有期检查 (盈利时跳过, 避免赎回费)
+                # 最短持有期检查 (盈利时跳过, 避开1.5%惩罚赎回费; 回测未计入0.5%常规费, 见 redeem_fee.py)
                 if hold_days < MIN_HOLD_DAYS and pnl_pct > 0:
                     continue
 
@@ -375,11 +426,27 @@ class BacktestEngine:
                         trade_count += 1
                         continue  # 已清仓, 不再检查止损
 
+                # === MA20趋势止损 ===
+                # 收盘价跌破 MA20×0.95 视为趋势结构破坏, 清仓
+                # 受 MIN_HOLD_DAYS 约束 (与实盘 strategy.check_stop_signals 一致)
+                if BT_MA20_RULES and hold_days >= MIN_HOLD_DAYS:
+                    ma20 = calc_ma20_bt(code, date, self.prices)
+                    if ma20 is not None and price < ma20 * MA20_STOP_LOSS_RATIO:
+                        if code in self.sat_holdings:
+                            self._sell_etf(h["name"], code, date, "satellite")
+                            below_pct = (price / ma20 - 1) * 100
+                            self.trades[-1]["tier"] = f"MA20SL({below_pct:.1f}%)"
+                            if code in self.peak_pnl:
+                                del self.peak_pnl[code]
+                            trade_count += 1
+                            continue  # 趋势止损触发, 不再检查固定止损
+
                 # === 止损 (不变) ===
                 stop_loss = abs(STOP_LOSS_THRESHOLD)
                 if pnl_pct <= -stop_loss and hold_days >= MIN_HOLD_DAYS:
                     if code in self.sat_holdings:
                         self._sell_etf(h["name"], code, date, "satellite")
+                        self.trades[-1]["tier"] = f"SL({pnl_pct:.1f}%)"
                         if code in self.peak_pnl:
                             del self.peak_pnl[code]
                         trade_count += 1
@@ -397,15 +464,34 @@ class BacktestEngine:
                     eligible = [(etf, sc) for etf, sc in momentum_scores
                                 if sc["composite"] > MOMENTUM_MIN_THRESHOLD]
                     top_codes = set(etf["code"] for etf, _ in eligible[:ROTATION_HOLD_COUNT])
+                    score_by_code = {etf["code"]: sc for etf, sc in momentum_scores}
+
+                    def _healthy(code):
+                        """持仓是否"还升": 综合动量>0 且 收盘>MA20 (与实盘同口径)"""
+                        sc = score_by_code.get(code)
+                        if sc is None or sc["composite"] <= MOMENTUM_MIN_THRESHOLD:
+                            return False
+                        if not BT_MA20_RULES:
+                            return True
+                        px = self._get_price(code, date)
+                        ma20 = calc_ma20_bt(code, date, self.prices)
+                        return px is not None and ma20 is not None and px > ma20
+
+                    buffer_codes = (set(etf["code"] for etf, _ in
+                                       eligible[:ROTATION_HOLD_COUNT + ROTATION_RANK_BUFFER])
+                                   if BT_ROTATION_BUFFER else top_codes)
 
                     # 如果没有合格的候选, 不卖出也不买入
                     if eligible:
-                        # 卖出: 持有但排名靠后, 且持有满14天
+                        # 卖出: 跌出Top(HOLD+BUFFER)缓冲区 或 动量/趋势转弱, 且持有满轮动周期
                         for code, h in list(self.sat_holdings.items()):
-                            if code not in top_codes:
+                            should_sell = (code not in buffer_codes
+                                          or (BT_ROTATION_BUFFER and not _healthy(code)))
+                            if should_sell:
                                 hold_days = self._date_diff(date, h["buy_date"])
                                 if hold_days >= ROTATION_CYCLE_DAYS:
                                     self._sell_etf(h["name"], code, date, "satellite")
+                                    self.trades[-1]["tier"] = "ROT(轮动)"
                                     if code in self.peak_pnl:
                                         del self.peak_pnl[code]
                                     trade_count += 1
@@ -418,13 +504,36 @@ class BacktestEngine:
                             if self._get_price(code, date)
                         )
                         available_for_sat = max(sat_target - sat_invested, 0)
-                        per_etf = sat_amount / ROTATION_HOLD_COUNT
+                        per_etf = _sat_per_etf(sat_amount)
+
+                        # 新建仓数量约束 (与实盘一致): 基础3只, 全健康时可超额至5只
+                        sat_count = len(self.sat_holdings)
+                        if BT_ROTATION_BUFFER:
+                            all_healthy = all(_healthy(c) for c in self.sat_holdings)
+                            if sat_count < ROTATION_HOLD_COUNT:
+                                buy_slots = ROTATION_HOLD_COUNT - sat_count
+                            elif sat_count < ROTATION_MAX_HOLD_COUNT and all_healthy:
+                                buy_slots = ROTATION_MAX_HOLD_COUNT - sat_count
+                            else:
+                                buy_slots = 0
+                        else:
+                            buy_slots = ROTATION_HOLD_COUNT - sat_count
 
                         for etf, score in eligible[:ROTATION_HOLD_COUNT]:
-                            if etf["code"] not in self.sat_holdings and self.cash >= per_etf:
-                                buy_amt = min(per_etf, self.cash)
-                                self._buy_etf(etf["name"], etf["code"], buy_amt, date, "satellite")
-                                trade_count += 1
+                            if buy_slots <= 0:
+                                break
+                            if etf["code"] in self.sat_holdings or self.cash < per_etf:
+                                continue
+                            # 买入闸门: 收盘价需在MA20上方 (与实盘 check_rotation_signals 一致)
+                            if BT_MA20_RULES:
+                                px = self._get_price(etf["code"], date)
+                                ma20 = calc_ma20_bt(etf["code"], date, self.prices)
+                                if px is None or ma20 is None or px <= ma20:
+                                    continue  # [SKIP] 不满足买入闸门
+                            buy_slots -= 1
+                            buy_amt = min(per_etf, self.cash)
+                            self._buy_etf(etf["name"], etf["code"], buy_amt, date, "satellite")
+                            trade_count += 1
 
                     last_rotation_date = date
 
@@ -519,14 +628,51 @@ class BacktestEngine:
             pnl = f"{t.get('pnl_pct', 0):>+.2f}%" if t["type"] == "sell" else ""
             report_lines.append(f"  {t['date']:<12} {direction:<4} {t['name']:<12} ¥{t['amount']:>10,.0f} {t['price']:>8.4f} {pnl:>8}")
 
+        # 卖出原因分布
+        reason_stats = defaultdict(lambda: {"n": 0, "win": 0, "pnl": 0.0})
+        for t in sell_trades:
+            tier = t.get("tier", "ROT(轮动)")
+            key = tier.split("(")[0]  # TS / MA20SL / SL / ROT
+            reason_stats[key]["n"] += 1
+            reason_stats[key]["pnl"] += t.get("pnl_pct", 0)
+            if t.get("pnl_pct", 0) > 0:
+                reason_stats[key]["win"] += 1
+
+        if reason_stats:
+            report_lines.append(f"\n  卖出原因分布:")
+            report_lines.append(f"  {'原因':<10} {'笔数':>6} {'胜率':>8} {'平均盈亏':>10}   说明")
+            report_lines.append(f"  {'-'*62}")
+            reason_desc = {
+                "TS": "移动止盈(跟踪峰值回撤)",
+                "MA20SL": "MA20趋势止损(跌破均线5%)",
+                "SL": f"固定止损({STOP_LOSS_THRESHOLD:.0f}%)",
+                "ROT": f"轮动调出(跌出Top{ROTATION_HOLD_COUNT + ROTATION_RANK_BUFFER}缓冲区/动量转弱)",
+            }
+            for key in ["TS", "MA20SL", "SL", "ROT"]:
+                if key not in reason_stats:
+                    continue
+                st = reason_stats[key]
+                wr = st["win"] / st["n"] * 100 if st["n"] else 0
+                avg = st["pnl"] / st["n"] if st["n"] else 0
+                report_lines.append(
+                    f"  {key:<10} {st['n']:>6} {wr:>7.1f}% {avg:>+9.2f}%   {reason_desc.get(key, '')}"
+                )
+
         # 策略参数
         report_lines.append(f"\n  策略参数:")
         report_lines.append(f"  宽基比例: {CORE_RATIO*100:.0f}%  行业比例: {SATELLITE_RATIO*100:.0f}%")
         report_lines.append(f"  动量周期: {MOMENTUM_SHORT}日/{MOMENTUM_MEDIUM}日, 权重{MOMENTUM_WEIGHT_SHORT}/{MOMENTUM_WEIGHT_MEDIUM}")
-        report_lines.append(f"  轮动持仓: 前{ROTATION_HOLD_COUNT}只, 轮动周期{ROTATION_CYCLE_DAYS}天")
+        report_lines.append(f"  轮动持仓: 基础前{ROTATION_HOLD_COUNT}只, 上限{ROTATION_MAX_HOLD_COUNT}只(全健康可超额), 轮动周期{ROTATION_CYCLE_DAYS}天")
+        report_lines.append(f"  排名缓冲区: {'启用 Top' + str(ROTATION_HOLD_COUNT + ROTATION_RANK_BUFFER) if BT_ROTATION_BUFFER else '关闭(跌出Top3即卖)'}")
         report_lines.append(f"  止盈: 移动止盈(激活+{TRAILING_STOP_ACTIVATE:.0f}%, 回撤{TRAILING_STOP_PULLBACK:.0f}%, Top1容限{TRAILING_STOP_TOP1_PULLBACK:.0f}%)  止损: {STOP_LOSS_THRESHOLD:.0f}%")
         report_lines.append(f"  PE择时: <{PE_BUY_THRESHOLD}%买入, >{PE_SELL_THRESHOLD}%卖出 (5年百分位)")
         report_lines.append(f"  动量门槛: 综合得分>{MOMENTUM_MIN_THRESHOLD}%才纳入轮动")
+        if BT_MA20_RULES:
+            report_lines.append(
+                f"  MA20防守: 买入闸门=收盘>MA20; 趋势止损=收盘<MA20×{MA20_STOP_LOSS_RATIO} (持有>={MIN_HOLD_DAYS}天)"
+            )
+        else:
+            report_lines.append("  MA20防守: [关闭] (BT_MA20_RULES=0)")
         report_lines.append("=" * 65)
 
         report = "\n".join(report_lines)

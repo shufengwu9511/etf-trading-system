@@ -19,10 +19,12 @@
 from datetime import datetime
 
 from config import (
-    SATELLITE_ETFS,
+    SATELLITE_ETFS, preferred_buy_code,
     MOMENTUM_SHORT, MOMENTUM_MEDIUM,
     MOMENTUM_WEIGHT_SHORT, MOMENTUM_WEIGHT_MEDIUM,
     MOMENTUM_MIN_THRESHOLD, ROTATION_HOLD_COUNT, MIN_HOLD_DAYS,
+    ROTATION_CYCLE_DAYS, MIN_POSITION_VALUE,
+    ROTATION_RANK_BUFFER, ROTATION_MAX_HOLD_COUNT,
 )
 from db import get_connection
 from tdx_data import get_realtime_quotes
@@ -88,10 +90,11 @@ def compute_momentum(closes, price):
 # ============================================================
 
 def _fund_code_to_etf(fund_code):
-    """联接基金代码 → 场内ETF配置信息"""
-    for etf in SATELLITE_ETFS:
-        if etf["fund_code"] == fund_code:
-            return etf
+    """联接基金代码 → 场内ETF配置信息(含低费率替代份额代码)"""
+    from config import find_etf_by_fund_code
+    info = find_etf_by_fund_code(fund_code)
+    if info and info["category"] == "satellite":
+        return info
     return None
 
 
@@ -129,14 +132,18 @@ def sync_holdings_from_portfolio():
     """
     conn = get_connection()
     rows = conn.execute("""
-        SELECT fund_code, etf_code, name, confirm_date, buy_date
+        SELECT fund_code, etf_code, name, confirm_date, buy_date, status,
+               COALESCE(market_value, 0) AS market_value
         FROM portfolio
-        WHERE status = 'holding' AND category = 'satellite'
+        WHERE status IN ('holding', 'pending_buy') AND category = 'satellite'
     """).fetchall()
     conn.close()
 
     result = {}
     for r in rows:
+        # 观察仓: 市值<MIN_POSITION_VALUE 不参与信号计算 (留作查看实际涨跌幅)
+        if r["market_value"] < MIN_POSITION_VALUE:
+            continue
         etf = _fund_code_to_etf(r["fund_code"])
         if etf is None:
             continue
@@ -146,6 +153,7 @@ def sync_holdings_from_portfolio():
             "etf_code": r["etf_code"],
             "name": r["name"],
             "buy_date": buy_date,
+            "status": r["status"],
         }
     return result
 
@@ -166,12 +174,29 @@ def init_holdings_state(holdings_arg=None):
 
 
 def calc_hold_days(buy_date_str):
-    """计算持有天数 (自然日)"""
+    """计算持有天数 (自然日, 含确认日当天), 与 portfolio._calc_hold_days 同源。
+
+    入参来自 sync_holdings_from_portfolio(), 实际传的是 confirm_date (份额确认日)。
+    🔴 2026-11-12 修正 off-by-one: 易方达口径为「申购确认日(含) ~ 赎回确认日
+    前一个自然日(含)」, 今日提交赎回则 T+1 确认, 故 = (today - confirm).days + 1。
+    旧实现少算 1 天, 会把可赎回日推迟一天; 盘中与主流程必须同口径, 否则
+    又会重现「盘中喊卖、主流程锁着」的指令分裂。
+    """
     try:
-        d = datetime.strptime(buy_date_str, "%Y%m%d")
-        return (datetime.now() - d).days
+        d = datetime.strptime(str(buy_date_str).replace("-", ""), "%Y%m%d")
+        return max(0, (datetime.now() - d).days + 1)
     except Exception:
         return 0
+
+
+def _row_healthy(r):
+    """持仓是否"还升": 综合动量>0 且 现价在MA20上方。
+    口径与 strategy._rotation_healthy / backtest 保持一致 (2026-11-09)。
+    """
+    if r is None:
+        return False
+    return (r.get("composite_score", 0) > MOMENTUM_MIN_THRESHOLD
+            and bool(r.get("above_ma20")))
 
 
 # ============================================================
@@ -218,7 +243,7 @@ def generate_signals(codes=None, holdings_arg=None):
     # 3. 盘中实时行情
     quotes = get_realtime_quotes([e["code"] for e in etfs], prev_close_map=prev_close)
     if not quotes:
-        return {"ok": False, "error": "实时行情获取失败 (pytdx连接异常或休市)"}
+        return {"ok": False, "error": "实时行情获取失败 (pytdx与AkShare均不可用, 或已休市)"}
 
     # 4. 计算动量并排名
     rows = []
@@ -235,7 +260,8 @@ def generate_signals(codes=None, holdings_arg=None):
             continue
         rows.append({
             "etf_code": code,
-            "fund_code": etf["fund_code"],
+            # 买入信号用低费率替代份额代码; 卖出/持有仍用持仓表实际 fund_code
+            "fund_code": preferred_buy_code(etf),
             "name": etf["name"],
             "price": q["price"],
             "last_close": q["last_close"],
@@ -255,18 +281,38 @@ def generate_signals(codes=None, holdings_arg=None):
     holdings = state.get("holdings", {})
 
     # 6. 生成信号
-    # 买入闸门: 综合得分>0 且 MA20上方 (与主系统 check_rotation_signals 一致)
-    eligible = [r for r in rows if r["composite_score"] > MOMENTUM_MIN_THRESHOLD and r["above_ma20"]]
-    top_n = eligible[:ROTATION_HOLD_COUNT]
-    top_codes = {r["etf_code"] for r in top_n}
+    # 卖出判定TopN = 纯动量前N (MA20只约束买入, 不提前过滤进TopN,
+    # 否则动量Top3内但当日跌破MA20的持仓会被误判"跌出前N", 与主系统修复后一致)
+    momentum_top = [r for r in rows if r["composite_score"] > MOMENTUM_MIN_THRESHOLD][:ROTATION_HOLD_COUNT]
+    top_codes = {r["etf_code"] for r in momentum_top}
+    buffer_limit = ROTATION_HOLD_COUNT + ROTATION_RANK_BUFFER
+    row_by_code = {r["etf_code"]: r for r in rows}
 
     buy_signals = []
     sell_signals = []
     hold_signals = []
     locked = []  # 7天锁未解锁
 
-    for r in top_n:
-        if r["etf_code"] not in holdings:
+    # --- 新建仓数量约束 (2026-11-09) ---
+    # 基础3只, 全部持仓仍健康时允许超额至 ROTATION_MAX_HOLD_COUNT 只。
+    # sync_holdings_from_portfolio 已排除观察仓; 在途申购无法判趋势, 视为健康。
+    sat_count = len(holdings)
+    all_healthy = all(_row_healthy(row_by_code.get(code))
+                      for code, h in holdings.items()
+                      if h.get("status") != "pending_buy")
+    if sat_count < ROTATION_HOLD_COUNT:
+        buy_slots = ROTATION_HOLD_COUNT - sat_count
+    elif sat_count < ROTATION_MAX_HOLD_COUNT and all_healthy:
+        buy_slots = ROTATION_MAX_HOLD_COUNT - sat_count
+    else:
+        buy_slots = 0
+
+    for r in momentum_top:
+        if buy_slots <= 0:
+            break
+        # 买入闸门: 未持有 + MA20上方 (综合得分>0 已由 momentum_top 过滤)
+        if r["etf_code"] not in holdings and r["above_ma20"]:
+            buy_slots -= 1
             buy_signals.append(r)
 
     for code, h in holdings.items():
@@ -281,13 +327,29 @@ def generate_signals(codes=None, holdings_arg=None):
                                  "rank": row["rank"],
                                  "reason": f"动量第{row['rank']}, 继续持有"})
         else:
+            # 缓冲区保护 (2026-11-09): 跌出Top3但仍在Top(HOLD+BUFFER)内,
+            # 且动量/趋势都还向上 → 继续持有, 不因排名边界抖动就赎回
+            if row["rank"] <= buffer_limit and _row_healthy(row):
+                hold_signals.append({"name": h["name"], "fund_code": h["fund_code"],
+                                     "rank": row["rank"],
+                                     "reason": (f"动量第{row['rank']}, 在Top{buffer_limit}缓冲区内"
+                                                f"(跌出Top{ROTATION_HOLD_COUNT}不硬切), 动量>0且MA20上方, 继续持有")})
+                continue
+
             hold_days = calc_hold_days(h.get("buy_date", ""))
-            if hold_days < MIN_HOLD_DAYS:
+            # 卖出门槛必须与主流程 strategy.py 保持一致: 跌出 TopN 后, 持有满
+            # ROTATION_CYCLE_DAYS 即可赎回。2026-11-05 用户取消 14 天缓冲,
+            # ROTATION_CYCLE_DAYS 已改 7 (与 MIN_HOLD_DAYS 赎回费锁相等),
+            # 所以现在"过 7 天就能卖"。历史上这里曾只判 MIN_HOLD_DAYS(7) 而
+            # 主流程判 14, 导致盘中比主流程提前一周喊卖; 用 max() 兜住两边,
+            # 将来任一常量变动都不会再出现口径分裂。
+            need_days = max(MIN_HOLD_DAYS, ROTATION_CYCLE_DAYS)
+            if hold_days < need_days:
                 locked.append({"name": h["name"], "fund_code": h["fund_code"],
                                "rank": row["rank"], "hold_days": hold_days})
                 hold_signals.append({"name": h["name"], "fund_code": h["fund_code"],
                                      "rank": row["rank"],
-                                     "reason": f"跌出Top{ROTATION_HOLD_COUNT}, 但仅持有{hold_days}天 (7天锁), 暂不赎回"})
+                                     "reason": f"跌出Top{buffer_limit}缓冲区或动量/趋势转弱, 但持有仅{hold_days}天 (需满{need_days}天), 暂不赎回"})
             else:
                 sell_signals.append({"name": h["name"], "fund_code": h["fund_code"],
                                      "rank": row["rank"], "hold_days": hold_days})
@@ -300,7 +362,7 @@ def generate_signals(codes=None, holdings_arg=None):
         "holdings_source": state.get("source", ""),
         "rankings": rows,
         "top_codes": top_codes,
-        "top_n": top_n,
+        "top_n": momentum_top,
         "buy": buy_signals,
         "sell": sell_signals,
         "hold": hold_signals,

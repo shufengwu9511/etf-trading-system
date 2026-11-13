@@ -11,6 +11,16 @@ data/*.db
 data/*.bak*
 data/tdx_cache/
 
+# 本地账户隐私 / 运行时产物 / 浏览器登录态 - 永不提交
+data/chrome_auto_profile/
+data/account_cash.json
+data/redeem_fee_pending.json
+data/tdx_external_hosts.json
+data/_*.html
+data/_*.txt
+data/*.log
+data/*.txt
+
 # 日志
 logs/
 

@@ -10,16 +10,30 @@ from db import get_connection
 from config import (
     TOTAL_CAPITAL, CORE_RATIO, SATELLITE_RATIO,
     CORE_ETFS, SATELLITE_ETFS, LOG_DIR,
-    PANIC_HS300_DROP, PANIC_NORTH_OUTFLOW,
+    preferred_buy_code, BUY_FUND_CODE_OVERRIDES,
+    PANIC_HS300_DROP, PANIC_NORTH_TURNOVER_RATIO,
     PANIC_LIMIT_DOWN_COUNT, PANIC_VOLUME_RATIO,
     PE_LOOKBACK_YEARS,
     MOMENTUM_SHORT, MOMENTUM_MEDIUM,
     MOMENTUM_WEIGHT_SHORT, MOMENTUM_WEIGHT_MEDIUM,
     TRAILING_STOP_ACTIVATE, TRAILING_STOP_PULLBACK,
+    CORE_STOP_LOSS_THRESHOLD,
+    CONCENTRATION_WARN_RATIO, CONCENTRATION_DANGER_RATIO,
+    MIN_POSITION_VALUE,
 )
+from portfolio import check_concentration, get_available_cash
 from etf_discovery import discover_candidates
 from breakout_discovery import discover_breakout_candidates
 from intraday_signal import generate_signals
+import realtime_quotes
+
+
+def _rnd(v, nd=4):
+    """把浮点噪声(如前复权除法产生的 0.39999999999999997)收敛为常规精度"""
+    try:
+        return round(float(v), nd)
+    except (TypeError, ValueError):
+        return v
 
 
 def collect_dashboard_data():
@@ -38,9 +52,19 @@ def collect_dashboard_data():
     """).fetchall()
     holdings = [dict(r) for r in rows]
     for h in holdings:
-        if h.get("buy_date"):
-            buy = datetime.strptime(h["buy_date"], "%Y%m%d")
-            h["hold_days"] = (datetime.now() - buy).days
+        # 持有天数显示与信号判定同源 (2026-11-12 统一口径):
+        #   有确认日 → (today - confirm).days + 1  [申购确认日含 ~ 赎回确认日前一自然日含]
+        #   无确认日 → (today - buy).days          [等价于按 T+1 确认估算, 不加 1]
+        # 旧逻辑一律用 buy_date 且不区分, 跨周末申购时会高估 2~3 天 (如 020602
+        # 11-06 申购 / 11-09 确认, 旧显示 6 天, 实际只有 4 天)。
+        confirm = h.get("confirm_date")
+        ref = confirm or h.get("buy_date")
+        if ref:
+            try:
+                d = datetime.strptime(str(ref).replace("-", ""), "%Y%m%d")
+                h["hold_days"] = max(0, (datetime.now() - d).days + (1 if confirm else 0))
+            except Exception:
+                h["hold_days"] = 0
         else:
             h["hold_days"] = 0
     data["holdings"] = holdings
@@ -51,7 +75,7 @@ def collect_dashboard_data():
         data["total_profit_loss"] / data["total_cost"] * 100
         if data["total_cost"] > 0 else 0
     )
-    data["available_cash"] = TOTAL_CAPITAL - data["total_market_value"]
+    data["available_cash"] = get_available_cash()
 
     # ---- 1b. 所有ETF近30日K线数据 (用于所有基金名称悬浮提示) ----
     # 收集所有需要K线的ETF代码 (去重), 按 etf_code (如 510310.SH) 索引
@@ -64,6 +88,10 @@ def collect_dashboard_data():
         fc = e.get("fund_code", "")
         if fc:
             fund2etf[fc] = e["code"]
+            # 低费率替代份额持仓也要能找到对应场内K线
+            alt = BUY_FUND_CODE_OVERRIDES.get(fc)
+            if alt:
+                fund2etf[alt] = e["code"]
 
     kline_data = {}
     for etf_code in all_kline_etfs:
@@ -75,8 +103,8 @@ def collect_dashboard_data():
         """, (etf_code,)).fetchall()
         if rows:
             kline_data[etf_code] = [
-                {"d": r["trade_date"], "o": r["open"], "c": r["close"],
-                 "h": r["high"], "l": r["low"], "v": r["vol"]}
+                {"d": r["trade_date"], "o": _rnd(r["open"]), "c": _rnd(r["close"]),
+                 "h": _rnd(r["high"]), "l": _rnd(r["low"]), "v": _rnd(r["vol"], 2)}
                 for r in rows
             ]
     data["holdings_kline"] = kline_data
@@ -105,7 +133,7 @@ def collect_dashboard_data():
     data["panic"] = dict(panic_row) if panic_row else {
         "alert_level": "UNKNOWN", "trigger_details": "",
         "hs300_pct_chg": None, "hs300_date": None,
-        "north_money": None, "north_date": None,
+        "north_money": None, "north_turnover_ratio": None, "north_date": None,
         "limit_down_count": None, "limit_down_date": None,
         "volume_ratio": None, "volume_date": None
     }
@@ -118,8 +146,17 @@ def collect_dashboard_data():
     """).fetchall()
     # 构建 fund_code → 基金公司 映射 (从 config 动态读取, 不再硬编码)
     _all_etfs = CORE_ETFS + SATELLITE_ETFS
-    _FUND_COMPANY_MAP = {e.get("fund_code", ""): e.get("company", "") for e in _all_etfs}
-    _etf_fund_map = {e["code"]: e.get("fund_code", "") for e in SATELLITE_ETFS}
+    _FUND_COMPANY_MAP = {}
+    for e in _all_etfs:
+        fc = e.get("fund_code", "")
+        if not fc:
+            continue
+        _FUND_COMPANY_MAP[fc] = e.get("company", "")
+        alt = BUY_FUND_CODE_OVERRIDES.get(fc)
+        if alt:
+            _FUND_COMPANY_MAP[alt] = e.get("company", "")
+    # 动量表显示「新钱该买的代码」(低费率份额), 而非老仓 A 类代码
+    _etf_fund_map = {e["code"]: preferred_buy_code(e) for e in SATELLITE_ETFS}
     data["momentum"] = []
     for r in momentum_rows:
         item = dict(r)
@@ -289,15 +326,15 @@ def collect_dashboard_data():
                 if code not in kline_data:
                     kline_data[code] = []
                 kline_data[code].append({
-                    "d": r["date"], "o": r["open"], "c": r["close"],
-                    "h": r["high"], "l": r["low"], "v": r["volume"]
+                    "d": r["date"], "o": _rnd(r["open"]), "c": _rnd(r["close"]),
+                    "h": _rnd(r["high"]), "l": _rnd(r["low"]), "v": _rnd(r["volume"], 2)
                 })
         
         _cache_conn.close()
     data["holdings_kline"] = kline_data
     
-    # ---- 8. 实时行情数据 ----
-    realtime = get_realtime_quotes()
+    # ---- 8. 实时行情数据 ---- (多渠道路由: pytdx 候选池 + 新浪/东财全市场, 见 realtime_quotes.py)
+    realtime = realtime_quotes.get_quotes()
     data["realtime"] = realtime
     
     # 构建实时行情表格HTML
@@ -312,10 +349,12 @@ def collect_dashboard_data():
                 pct = quote.get('pct_chg', 0)
                 pct_color = "#22c55e" if pct < 0 else "#ef4444"
                 pct_sign = "+" if pct >= 0 else ""
+                px_v = quote.get('price')
+                px_txt = f"{px_v:.3f}" if isinstance(px_v, (int, float)) else "--"
                 realtime_table += f'''
                 <tr>
                     <td style="padding:6px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{etf['code']}">{etf['name']}</td>
-                    <td style="padding:6px 12px;text-align:right">{quote.get('price', '--')}</td>
+                    <td style="padding:6px 12px;text-align:right">{px_txt}</td>
                     <td style="padding:6px 12px;text-align:right;color:{pct_color};font-weight:600">{pct_sign}{pct:.2f}%</td>
                 </tr>'''
     
@@ -330,7 +369,7 @@ def collect_dashboard_data():
             if quote:
                 rt_momentum.append({
                     'name': etf['name'],
-                    'fund_code': etf.get('fund_code', ''),
+                    'fund_code': preferred_buy_code(etf),
                     'company': etf.get('company', ''),
                     'pct_chg': quote.get('pct_chg', 0),
                 })
@@ -350,6 +389,14 @@ def collect_dashboard_data():
     data["intraday"] = intraday
     data["intraday_html"] = _render_intraday(intraday)
 
+    # ---- 9. 卖出信号逾期未执行 (2026-10-23新增, 执行纪律提醒) ----
+    try:
+        from strategy import check_unexecuted_signals
+        data["unexecuted"] = check_unexecuted_signals(holdings=holdings)
+    except Exception as e:
+        print(f"  [WARN] 逾期信号检查失败: {e}")
+        data["unexecuted"] = []
+
     return data
 
 
@@ -360,8 +407,12 @@ def _fmt_pct(val):
     return f"{sign}{val:.2f}%"
 
 
-def get_realtime_quotes():
-    """
+def _legacy_get_realtime_quotes_akshare():
+    """[已废弃 2026-09-24] 旧实现: 只走 AkShare `fund_etf_spot_em()` (push2delay 域名)。
+
+    该域名在部分网络环境下被拦截/限流 (RemoteDisconnected), 会导致整块实时行情失败。
+    已由 realtime_quotes.get_quotes() 取代 (pytdx + 新浪 + 东财多渠道), 此处仅留档对照。
+
     获取所有ETF的实时行情 (通过AkShare)
     返回: {
         'etf_quotes': [{'code','name','price','pct_chg'}, ...],
@@ -493,7 +544,7 @@ def _render_action(action, panic):
         <div style="margin-bottom:16px">
             <h4 style="font-size:15px;color:#374151;margin-bottom:8px">📊 宽基底仓信号</h4>
             <table style="width:100%">
-                <thead><tr><th>标的</th><th>基金代码</th><th>目标金额</th><th>逻辑</th></tr></thead>
+                <thead><tr><th>标的</th><th>基金代码</th><th>建议金额</th><th>逻辑</th></tr></thead>
                 <tbody>{core_rows}</tbody>
             </table>
         </div>''')
@@ -531,7 +582,7 @@ def _render_action(action, panic):
             <h4 style="font-size:15px;color:#374151;margin-bottom:8px">🔄 行业ETF动量轮动</h4>
             <div style="font-size:12px;color:#6b7280;margin-bottom:8px">
                 <span style="font-weight:600;color:#1e40af">买入闸门(三重全满足):</span> ① 动量Top3 ② 复合动量&gt;0 ③ 收盘价在MA20上方 &nbsp;|&nbsp;
-                <span style="font-weight:600;color:#991b1b">卖出防线(任一触发):</span> ① 移动止盈(8%激活/6%回撤) ② MA20×0.95趋势止损 ③ 固定止损(-15%) ④ 跌出Top3(14天缓冲)
+                <span style="font-weight:600;color:#991b1b">卖出防线(任一触发):</span> ① 移动止盈(8%激活/6%回撤) ② MA20×0.95趋势止损 ③ 固定止损(-15%) ④ 跌出Top5缓冲区 或 动量转负/跌破MA20(持有满7天即可卖) &nbsp;|&nbsp; <span style="font-weight:600;color:#1e40af">持仓:</span> 基础Top3, 全部持仓仍向上时可超额至5只
             </div>
             {'<table style="width:100%;margin-bottom:8px"><thead><tr><th>信号日期</th><th>标的</th><th>基金代码</th><th>金额</th><th>原因</th></tr></thead><tbody>' + buy_rows + '</tbody></table>' if rot_buy else ''}
             {'<table style="width:100%"><thead><tr><th>信号日期</th><th>标的</th><th>基金代码</th><th>金额</th><th>原因</th></tr></thead><tbody>' + sell_rows + '</tbody></table>' if rot_sell else ''}
@@ -552,6 +603,65 @@ def _fmt_pct(val):
     if val is None:
         return "--"
     return f"{val:+.2f}%"
+
+
+def _render_overdue(items):
+    """
+    渲染"卖出信号逾期未执行"告警条 (2026-10-23新增)
+
+    目的: 把"看见信号但不动手"本身变成看板顶部的一条硬提醒。
+    数据来自 strategy.check_unexecuted_signals(), 只统计清仓类硬信号
+    (trend_stop / stop_loss / trailing_stop), 观察仓与已清仓标的自动排除。
+    """
+    if not items:
+        return ""
+    total = sum((x.get("est_slippage") or 0) for x in items)
+    rows = []
+    for x in items:
+        d0 = x.get("first_signal_date") or ""
+        d_fmt = f"{d0[:4]}-{d0[4:6]}-{d0[6:]}" if len(d0) == 8 else d0
+        chg = x.get("price_change_pct")
+        chg_html = (f'<span style="color:#b91c1c;font-weight:600">{chg:+.2f}%</span>'
+                    if chg is not None else '<span style="color:#9ca3af">--</span>')
+        slip = x.get("est_slippage")
+        slip_html = (f'<span style="color:#b91c1c;font-weight:600">¥{slip:,.0f}</span>'
+                     if slip else '<span style="color:#9ca3af">--</span>')
+        rows.append(
+            '<tr>'
+            f'<td style="padding:10px 12px;border-bottom:1px solid #fee2e2">'
+            f'<span style="font-weight:600">{x["name"]}</span>'
+            f'<span style="color:#9ca3af;font-size:12px"> {x["fund_code"]}</span></td>'
+            f'<td style="padding:10px 12px;text-align:center;border-bottom:1px solid #fee2e2;color:#b91c1c;font-weight:700;font-size:15px">{x["days"]} 天</td>'
+            f'<td style="padding:10px 12px;text-align:center;border-bottom:1px solid #fee2e2;color:#6b7280">{d_fmt}</td>'
+            f'<td style="padding:10px 12px;text-align:center;border-bottom:1px solid #fee2e2">{chg_html}</td>'
+            f'<td style="padding:10px 12px;text-align:right;border-bottom:1px solid #fee2e2">{slip_html}</td>'
+            '</tr>'
+        )
+    return f'''
+<div style="background:#fff5f5;border:1px solid #fecaca;border-left:4px solid #dc2626;border-radius:12px;padding:18px 22px;margin-bottom:20px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px">
+        <span style="font-size:17px">⏰</span>
+        <span style="font-size:16px;font-weight:700;color:#b91c1c">卖出信号逾期未执行</span>
+        <span style="font-size:12px;color:#6b7280">系统连续报警，但账上没有任何对应的赎回记录</span>
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;color:#1f2937;margin-top:8px">
+        <thead>
+            <tr style="color:#9ca3af;font-size:12px">
+                <th style="padding:6px 12px;font-weight:400;text-align:left">标的</th>
+                <th style="padding:6px 12px;font-weight:400;text-align:center">连续逾期</th>
+                <th style="padding:6px 12px;font-weight:400;text-align:center">起报日</th>
+                <th style="padding:6px 12px;font-weight:400;text-align:center">信号后涨跌</th>
+                <th style="padding:6px 12px;font-weight:400;text-align:right">预估拖延成本</th>
+            </tr>
+        </thead>
+        <tbody>{''.join(rows)}</tbody>
+    </table>
+    <div style="margin-top:12px;font-size:12px;color:#7f1d1d;background:#fee2e2;border-radius:8px;padding:10px 12px;line-height:1.6">
+        合计预估拖延成本 <strong style="font-size:15px">¥{total:,.0f}</strong>
+        ｜ 按规则该赎回的标的，拖一天就多承担一天下跌。
+        执行尺度可以商量（全清 / 减半），但"什么都不做"不在选项中。
+    </div>
+</div>'''
 
 
 def _render_intraday(intraday):
@@ -651,7 +761,7 @@ def _render_intraday(intraday):
             </table>
         </div>
         <div style="margin-top:8px;font-size:11px;color:#9ca3af">
-            ⭐=买入闸门通过(Top3) · 🔒=7天锁内暂不赎回 · 本信号仅作参考, 临界信号建议次日确认; 实际申赎请在持仓系统(main.py)中维护
+            ⭐=买入闸门通过(Top3) · 🔒=7天锁内暂不赎回 · Top5缓冲区内且动量/趋势仍向上则继续持有 · 本信号仅作参考, 临界信号建议次日确认; 实际申赎请在持仓系统(main.py)中维护
         </div>
     </div>
 </div>'''
@@ -807,14 +917,24 @@ def generate_html(data):
     realtime = d.get("realtime", {})
     realtime_table = d.get("realtime_table", "")
     intraday_html = d.get("intraday_html", "")
+    overdue_html = _render_overdue(d.get("unexecuted") or [])
     is_panic = panic.get("alert_level") == "PANIC"
     is_warning = panic.get("alert_level") == "WARNING"
     
     # 实时恐慌指数
     rt_panic_score = realtime.get("panic_score")
+    rt_market_wide = bool(realtime.get("market_wide"))
     rt_panic_color = "#22c55e" if (rt_panic_score is not None and rt_panic_score < 30) else ("#f59e0b" if (rt_panic_score and rt_panic_score < 60) else ("#ef4444" if rt_panic_score else "#6b7280"))
     rt_panic_text = "实时恐慌" if (rt_panic_score and rt_panic_score >= 60) else ("实时警惕" if (rt_panic_score and rt_panic_score >= 30) else ("实时正常" if rt_panic_score else "实时N/A"))
     rt_panic_icon = "🚨" if (rt_panic_score and rt_panic_score >= 60) else ("⚠️" if (rt_panic_score and rt_panic_score >= 30) else ("✅" if rt_panic_score else "❓"))
+    # 全市场快照不可用时显示 --, 避免 0/0% 这类会被误读成"零下跌"的假数据
+    rt_down_count = str(realtime.get("down_count")) if rt_market_wide else "--"
+    rt_down_ratio = f"{realtime.get('down_ratio'):.1f}%" if rt_market_wide else "--"
+    rt_avg_pct = f"{realtime.get('avg_pct'):+.2f}%" if rt_market_wide else "--"
+    rt_source = realtime.get("source") or ""
+    rt_market_note = "" if rt_market_wide else (
+        '<div style="font-size:11px;color:#9ca3af;margin-top:6px">'
+        '全市场快照不可用，未计算（候选池行情不受影响）</div>')
     
     # 恐慌仪表盘颜色
     panic_bg = "#ef4444" if is_panic else ("#f59e0b" if is_warning else "#22c55e")
@@ -897,15 +1017,38 @@ def generate_html(data):
         </div>'''
 
     # 持仓行
+    def _conc_cell(market_value):
+        """单只持仓占总资金比例, 超限标色 (预警15% / 危险25%)"""
+        mv = market_value or 0
+        ratio = mv / TOTAL_CAPITAL if TOTAL_CAPITAL else 0
+        if ratio >= CONCENTRATION_DANGER_RATIO:
+            color, tag = "#ef4444", "⚠️危险"
+        elif ratio >= CONCENTRATION_WARN_RATIO:
+            color, tag = "#f59e0b", "预警"
+        else:
+            color, tag = "#6b7280", ""
+        tag_html = f'<br><span style="font-size:11px;color:{color}">{tag}</span>' if tag else ""
+        return (f'<span style="font-weight:600;color:{color}">{ratio*100:.1f}%</span>{tag_html}')
+
     def _holdings_table(items, title):
         if not items:
             return ""
         rows_html = ""
         for h in items:
             pl_cls = "#22c55e" if h["profit_pct"] < 0 else "#ef4444"
+            # 观察仓: 市值<MIN_POSITION_VALUE, 不参与信号计算 (仅查看涨跌)
+            watch_only = (h.get("market_value") or 0) < MIN_POSITION_VALUE
+            watch_tag = (
+                ' <span title="市值低于1000元, 不参与赎回/补仓/止盈止损信号, 仅用于查看实际涨跌幅"'
+                ' style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;'
+                'font-weight:600;color:#6b7280;background:#f3f4f6;border:1px solid #e5e7eb">👀观察</span>'
+            ) if watch_only else ""
             # 止盈跟踪状态
             if h.get("category") == "core":
-                trail_html = '<span style="color:#9ca3af">估值管理</span>'
+                trail_html = (f'<span style="color:#9ca3af">估值管理</span>'
+                              f'<br><span style="font-size:11px;color:#9ca3af">兜底止损 {CORE_STOP_LOSS_THRESHOLD:.0f}%</span>')
+            elif watch_only:
+                trail_html = '<span style="color:#9ca3af">观察仓·不操作</span><br><span style="font-size:11px;color:#9ca3af">市值&lt;1000元</span>'
             else:
                 peak = h.get("peak_profit_pct") or 0
                 profit = h["profit_pct"] or 0
@@ -931,19 +1074,22 @@ def generate_html(data):
                         f'<span style="font-size:11px;color:#9ca3af">'
                         f'{profit:.2f}% / {TRAILING_STOP_ACTIVATE:.0f}%</span>'
                     )
-                # 追加MA20趋势状态
-                if h.get("above_ma20", 1) == 1:
+                # 追加MA20趋势状态 (在途申购份额未确认, 净值/MA20 判定无意义)
+                if h.get("status") == "pending_buy":
+                    trail_html += '<br><span style="font-size:11px;color:#9ca3af">⏳ 份额待确认</span>'
+                elif h.get("above_ma20", 1) == 1:
                     trail_html += '<br><span style="font-size:11px;color:#22c55e">🟢 MA20上方</span>'
                 else:
                     trail_html += '<br><span style="font-size:11px;color:#ef4444;font-weight:600">🔴 MA20下方(趋势止损区)</span>'
             rows_html += f'''
             <tr>
-                <td style="padding:10px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{h['etf_code']}">{h['name']}</td>
+                <td style="padding:10px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{h['etf_code']}">{h['name']}{watch_tag}</td>
                 <td style="padding:10px 12px;color:#6b7280">{h['fund_code']}</td>
                 <td style="padding:10px 12px;text-align:right">{h['shares']:,.2f}</td>
                 <td style="padding:10px 12px;text-align:right">{h['cost_nav']:.4f}</td>
                 <td style="padding:10px 12px;text-align:right">{h['current_nav']:.4f}<br><span style="font-size:11px;color:#9ca3af">{h.get('nav_date','')}</span></td>
                 <td style="padding:10px 12px;text-align:right;font-weight:600">{_fmt_money(h['market_value'])}</td>
+                <td style="padding:10px 12px;text-align:right">{_conc_cell(h['market_value'])}</td>
                 <td style="padding:10px 12px;text-align:right;font-weight:700;color:{pl_cls}">{_fmt_pct(h['profit_pct'])}</td>
                 <td style="padding:10px 12px;text-align:right;font-size:12px">{trail_html}</td>
                 <td style="padding:10px 12px;text-align:right;font-weight:600;color:{pl_cls}">{_fmt_money(h['profit_loss'])}</td>
@@ -962,6 +1108,7 @@ def generate_html(data):
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">成本净值</th>
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">当前净值(日期)</th>
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">市值</th>
+                        <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280" title="单只持仓占总资金比例。预警15% / 危险25%">占总资金</th>
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">盈亏%</th>
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">止盈跟踪</th>
                         <th style="padding:10px 12px;text-align:right;font-weight:600;color:#6b7280">盈利金额</th>
@@ -973,7 +1120,41 @@ def generate_html(data):
             </div>
         </div>'''
 
-    holdings_html = _holdings_table(d["core_holdings"], "📊 宽基底仓")
+    # 集中度风控预警卡片
+    conc_html = ""
+    try:
+        conc = check_concentration()
+        if conc["alerts"]:
+            cards = ""
+            for a in conc["alerts"]:
+                danger = a["level"] == "danger"
+                border = "#ef4444" if danger else "#f59e0b"
+                bg = "#fef2f2" if danger else "#fffbeb"
+                icon = "🔴" if danger else "🟡"
+                tag = "危险" if danger else "预警"
+                cards += f'''
+        <div style="flex:1;min-width:280px;background:{bg};border-left:4px solid {border};border-radius:8px;padding:14px 16px">
+            <div style="font-weight:600;color:#374151;margin-bottom:6px">{icon} {a['name']} <span style="color:{border}">({tag})</span></div>
+            <div style="font-size:22px;font-weight:700;color:{border}">{a['ratio']*100:.1f}%</div>
+            <div style="font-size:12px;color:#6b7280;margin-top:4px">占总资金 (市值 ¥{a['market_value']:,.0f})</div>
+            <div style="font-size:12px;color:#6b7280">盈亏 <span style="font-weight:600">{"-" if (a['profit_pct'] or 0) < 0 else "+"}{abs(a['profit_pct'] or 0):.2f}%</span></div>
+            <div style="font-size:12px;color:#374151;margin-top:6px">减至{CONCENTRATION_WARN_RATIO*100:.0f}%预警线需赎回 <b>¥{a['excess_amount']:,.0f}</b></div>
+        </div>'''
+            conc_html = f'''
+        <div style="background:#fff;border-radius:12px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:20px">
+            <h3 style="margin:0 0 4px;font-size:16px;color:#374151">🎯 集中度风控</h3>
+            <div style="font-size:12px;color:#9ca3af;margin-bottom:14px">
+                单只持仓占总资金比例 · 预警线 {CONCENTRATION_WARN_RATIO*100:.0f}% / 危险线 {CONCENTRATION_DANGER_RATIO*100:.0f}%
+                &nbsp;|&nbsp; 注: SINGLE_ETF_MAX_RATIO 只约束单笔买入金额，对累计持仓无上限，向下摊平会持续推高集中度
+            </div>
+            <div style="display:flex;gap:14px;flex-wrap:wrap">{cards}
+            </div>
+        </div>'''
+    except Exception as e:
+        conc_html = f'<!-- 集中度检查失败: {e} -->'
+
+    holdings_html = conc_html
+    holdings_html += _holdings_table(d["core_holdings"], "📊 宽基底仓")
     holdings_html += _holdings_table(d["satellite_holdings"], "🔄 行业卫星")
     holdings_html += _holdings_table(d["other_holdings"], "📦 其他持仓")
     if not d["holdings"]:
@@ -1041,9 +1222,11 @@ def generate_html(data):
     hs300_color = "#22c55e" if (hs300_pct is not None and hs300_pct < 0) else "#ef4444"
     hs300_date_str = _fmt_date(panic.get("hs300_date"))
 
-    north = panic.get("north_money")
-    north_display = f"{north/10000:.1f}亿" if north is not None else "--"
-    north_color = "#22c55e" if (north is not None and north < 0) else "#ef4444"
+    # 北向: 2024-08起净流入已停止披露, north_money 实为成交流水(恒正)无法判方向,
+    #       改显示"成交额异动倍数" = 当日成交额 / 近20日均值
+    north = panic.get("north_turnover_ratio")
+    north_display = f"{north:.2f}x" if north is not None else "--"
+    north_color = "#ef4444" if (north is not None and north >= PANIC_NORTH_TURNOVER_RATIO) else "#22c55e"
     north_date_str = _fmt_date(panic.get("north_date"))
 
     vol_ratio = panic.get("volume_ratio")
@@ -1269,6 +1452,8 @@ def generate_html(data):
     </div>
 </div>
 
+{overdue_html}
+
 <!-- 核心指标卡片 -->
 <div class="cards">
     <div class="card">
@@ -1310,7 +1495,7 @@ def generate_html(data):
                 </div>
                 <div class="panic-metric">
                     <div class="val" style="color:{north_color}">{north_display}</div>
-                    <div class="label">北向资金 <span style="font-size:10px;opacity:0.7">{'(' + north_date_str + ')' if north_date_str else ''}</span></div>
+                    <div class="label">北向异动 <span style="font-size:10px;opacity:0.7">{'(' + north_date_str + ')' if north_date_str else ''}</span></div>
                 </div>
                 <div class="panic-metric">
                     <div class="val" style="color:{ld_color}">{ld_display}</div>
@@ -1335,7 +1520,7 @@ def generate_html(data):
 <!-- 实时行情 + 实时恐慌 -->
 <div class="section">
     <div class="card">
-        <h3 style="margin-bottom:16px;font-size:16px;color:#374151">⚡ 实时行情 <span style="font-size:12px;color:#9ca3af;font-weight:400">{realtime.get('update_time','')}</span></h3>
+        <h3 style="margin-bottom:16px;font-size:16px;color:#374151">⚡ 实时行情 <span style="font-size:12px;color:#9ca3af;font-weight:400">{realtime.get('update_time','')} {rt_source}</span></h3>
         <div style="overflow-x:auto">
             <table style="width:100%;border-collapse:collapse;font-size:13px">
                 <thead><tr style="background:#f9fafb;border-bottom:2px solid #e5e7eb">
@@ -1359,18 +1544,19 @@ def generate_html(data):
             </div>
             <div class="panic-metrics">
                 <div class="panic-metric">
-                    <div class="val" style="color:#ef4444">{realtime.get('down_count',0)}</div>
+                    <div class="val" style="color:#ef4444">{rt_down_count}</div>
                     <div class="label">下跌ETF数</div>
                 </div>
                 <div class="panic-metric">
-                    <div class="val" style="color:#ef4444">{realtime.get('down_ratio','--')}%</div>
+                    <div class="val" style="color:#ef4444">{rt_down_ratio}</div>
                     <div class="label">下跌占比</div>
                 </div>
                 <div class="panic-metric">
-                    <div class="val" style="color:#6b7280">{realtime.get('avg_pct','--')}%</div>
+                    <div class="val" style="color:#6b7280">{rt_avg_pct}</div>
                     <div class="label">平均涨跌幅</div>
                 </div>
             </div>
+            {rt_market_note}
         </div>
     </div>
 </div>

@@ -43,9 +43,16 @@
   },
   {
     "code": "515650.SH",
-    "name": "消费50ETF联接A",
+    "name": "消费50ETF",
     "fund_code": "008975",
     "category": "satellite",
     "company": "富国"
+  },
+  {
+    "code": "159588.SZ",
+    "name": "石油天然气ETF联接A",
+    "fund_code": "021822",
+    "category": "satellite",
+    "company": "景顺长城"
   }
 ]

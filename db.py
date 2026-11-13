@@ -84,6 +84,7 @@ def init_db():
             trigger_details TEXT,
             hs300_pct_chg REAL,
             north_money REAL,
+            north_turnover_ratio REAL,
             limit_down_count INTEGER,
             volume_ratio REAL,
             created_at TEXT DEFAULT (datetime('now', 'localtime'))
@@ -194,6 +195,13 @@ def init_db():
         conn.commit()
     if "nav_date" not in existing_cols:
         cursor.execute("ALTER TABLE portfolio ADD COLUMN nav_date TEXT")
+        conn.commit()
+
+    # panic_alerts: 北向指标改为"成交额异动倍数"(原 north_money 为成交流水, 恒正无法判净流出)
+    cursor.execute("PRAGMA table_info(panic_alerts)")
+    panic_cols = {row[1] for row in cursor.fetchall()}
+    if "north_turnover_ratio" not in panic_cols:
+        cursor.execute("ALTER TABLE panic_alerts ADD COLUMN north_turnover_ratio REAL")
         conn.commit()
 
     conn.close()

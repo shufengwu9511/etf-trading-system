@@ -10,15 +10,18 @@ from datetime import datetime
 
 # 修复 Windows 控制台编码问题
 if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace",
+                                  line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace",
+                                  line_buffering=True)
 
 # 确保项目根目录在 Python 路径中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from db import init_db, get_connection
 from data_fetcher import run_full_data_update
-from strategy import check_panic_alert, check_core_etf_signals, check_rotation_signals, check_stop_signals
+from strategy import (check_panic_alert, check_core_etf_signals, check_rotation_signals,
+                      check_stop_signals, check_unexecuted_signals)
 from portfolio import (
     get_current_holdings, generate_action_sheet,
     save_signals_to_db, calc_position_sizes,
@@ -29,6 +32,17 @@ from portfolio import (
 )
 from dashboard import generate_dashboard
 from config import LOG_DIR
+
+# 2026-10-30: 预初始化 py_mini_racer/V8 —— akshare 解析新浪 JS 时才首次创建引擎,
+# 若发生在并行预取的工作线程里, 多线程竞态会偶发
+# [FATAL:partition_address_space.cc(243)] Check failed: !IsConfigurablePoolInitialized()
+# (V8 双重初始化, 进程级 abort, try/except 抓不住)。主线程提前初始化一次,
+# 后续工作线程自动复用句柄, 不再触发竞态。
+try:
+    import py_mini_racer
+    py_mini_racer.init_mini_racer(ignore_duplicate_init=True)
+except Exception:
+    pass
 
 
 def _cleanup_old_logs(keep_days=7):
@@ -95,10 +109,11 @@ def run_daily():
     # Step 3: 策略计算
     print("\n[Step 4/6] 运行策略引擎...")
 
-    # 3a: 宽基PE择时
+    # 3a: 宽基PE择时 (需要当前持仓, 才能把估值/趋势信号落地为可执行动作)
     print("  [3a] 宽基PE估值择时...")
     try:
-        core_signals = check_core_etf_signals()
+        holdings = get_current_holdings()
+        core_signals = check_core_etf_signals(holdings)
         for sig in core_signals:
             d = {"buy": "🟢买入", "sell": "🔴卖出", "reduce": "🟡减仓", "hold": "⚪持有"}
             print(f"    {d.get(sig['direction'], sig['direction'])} {sig['name']}: {sig['reason']}")
@@ -109,7 +124,6 @@ def run_daily():
     # 3b: 行业动量轮动
     print("  [3b] 行业ETF动量轮动...")
     try:
-        holdings = get_current_holdings()
         rotation_result = check_rotation_signals(holdings)
         buy_list = rotation_result.get("buy", [])
         sell_list = rotation_result.get("sell", [])
@@ -170,6 +184,27 @@ def run_daily():
     # 保存信号到数据库
     save_signals_to_db(signals_result, panic_alert)
 
+    # 执行纪律检查: 卖出信号逾期未执行 (2026-10-23新增)
+    try:
+        overdue = check_unexecuted_signals()
+        if overdue:
+            print("\n" + "=" * 70)
+            print("  ⏰ 卖出信号逾期未执行 (系统连续报警, 但账上无对应赎回记录)")
+            print("=" * 70)
+            total_slip = 0.0
+            for o in overdue:
+                slip = o.get("est_slippage") or 0
+                total_slip += slip
+                chg = o.get("price_change_pct")
+                chg_s = f"{chg:+.2f}%" if chg is not None else "--"
+                print(f"    🔴 {o['name']} ({o['fund_code']}): 连续 {o['days']} 个交易日未执行")
+                print(f"       起报日 {o['first_signal_date']} | 信号后 {chg_s} | "
+                      f"市值 ¥{o['market_value']:,.0f} | 预估拖延成本 ¥{slip:,.0f}")
+            print(f"    合计预估拖延成本: ¥{total_slip:,.0f}")
+            print("    提示: 执行尺度可商量(全清/减半), 但'什么都不做'不是选项。")
+    except Exception as e:
+        print(f"  [WARN] 逾期信号检查失败: {e}")
+
     # Step 5: 输出操作提示单
     print("\n[Step 6/6] ============ 操作提示单 ============")
     print(action_sheet)
@@ -223,6 +258,7 @@ def run_sell(fund_code, args):
       python main.py sell <fund_code> --ratio 0.5  # 赎回50%
       python main.py sell <fund_code> --shares 5000 # 赎回5000份
       python main.py sell <fund_code> --submit-date 20260618 --confirm-date 20260619  # 指定日期
+      python main.py sell <fund_code> --fee 112.31   # 按平台实际赎回费补录(优先于费率表)
     """
     print("=" * 60)
     print("  标记赎回")
@@ -243,6 +279,7 @@ def run_sell(fund_code, args):
     shares = None
     submit_date = None
     confirm_date = None
+    fee = None
     i = 0
     while i < len(args):
         if args[i] == "--ratio" and i + 1 < len(args):
@@ -257,10 +294,14 @@ def run_sell(fund_code, args):
         elif args[i] == "--confirm-date" and i + 1 < len(args):
             confirm_date = args[i + 1]
             i += 2
+        elif args[i] == "--fee" and i + 1 < len(args):
+            fee = float(args[i + 1])
+            i += 2
         else:
             i += 1
 
-    sell_holding_partial(fund_code, ratio=ratio, shares=shares, submit_date=submit_date, confirm_date=confirm_date)
+    sell_holding_partial(fund_code, ratio=ratio, shares=shares,
+                         submit_date=submit_date, confirm_date=confirm_date, fee=fee)
 
 
 def run_update(fund_code, args):

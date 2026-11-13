@@ -13,13 +13,23 @@
 
 import os
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
 from pytdx.hq import TdxHq_API
 
-from tdx_data import _get_server, _fetch_xdxr, _apply_xdxr_adjustment
+from tdx_data import (_get_server, _fetch_xdxr, _apply_xdxr_adjustment,
+                      _fetch_kline_sina)
 from config import CORE_ETFS, SATELLITE_ETFS
+
+# 并发写 etf_cache.db 的串行锁 (SQLite 单写者)
+_db_write_lock = threading.Lock()
+
+# K线拉取并发数 (新浪接口, 实测 6 并发稳定无限流; 10 并发把 936 只的
+# 每日增量从 ~40s 压到 ~20s, 见 2026-10-26 实测)
+KLINE_WORKERS = 10
 
 # ── 路径 ──
 CACHE_DIR = os.path.join("data", "tdx_cache")
@@ -247,22 +257,58 @@ def _fetch_kline(api, code: str, market: int,
         return []
 
 
+def _fetch_kline_sina_range(code: str, market: int,
+                            start_date: str, end_date: str,
+                            adjust: bool = False) -> list[dict]:
+    """从新浪拉取单只ETF K线并截取日期范围 (2026-10-23 新增)
+
+    为什么加这条路径: pytdx get_security_bars 被服务端拒绝后, 原来的
+    _fetch_kline() 拿不到任何数据, 全市场缓存自 10-22 起就停更了
+    (动量发现功能静默失效)。新浪实测 0.24s/只、947 只 6 并发约 38s。
+
+    adjust=True 时叠加 pytdx 官方 xdxr 前复权。增量更新默认关闭:
+      - 前复权对"最新交易日"不做任何调整, 增量新写入的行本来就是原始价
+      - 历史区间的复权已在首次全量时完成
+      - 每只多一次 pytdx 往返(0.3s), 947 只就是 5 分钟, 不值得
+    需要重算历史(如新发生拆分)时用 update_etf_cache(force=True) 走全量复权。
+    """
+    ts_code = f"{code}.SH" if market == 1 else f"{code}.SZ"
+    df = _fetch_kline_sina(ts_code)
+    if df.empty:
+        return []
+
+    if adjust:
+        xdxr = _fetch_xdxr(None, market, code, ts_code)
+        if xdxr:
+            df = _apply_xdxr_adjustment(df, xdxr)
+
+    df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
+    return [
+        {
+            "date": r.date, "open": r.open, "high": r.high, "low": r.low,
+            "close": r.close, "volume": r.vol, "amount": r.amount,
+        }
+        for r in df.itertuples(index=False)
+    ]
+
+
 def _save_klines_batch(db_path: str, code: str, rows: list[dict]):
     if not rows:
         return
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=20)
     try:
-        conn.executemany(
-            """INSERT OR REPLACE INTO kline_data
-               (code, date, open, high, low, close, volume, amount)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                (code, r["date"], r["open"], r["high"], r["low"],
-                 r["close"], r["volume"], r.get("amount", 0))
-                for r in rows
-            ],
-        )
-        conn.commit()
+        with _db_write_lock:
+            conn.executemany(
+                """INSERT OR REPLACE INTO kline_data
+                   (code, date, open, high, low, close, volume, amount)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (code, r["date"], r["open"], r["high"], r["low"],
+                     r["close"], r["volume"], r.get("amount", 0))
+                    for r in rows
+                ],
+            )
+            conn.commit()
     finally:
         conn.close()
 
@@ -287,26 +333,23 @@ def update_etf_cache(force: bool = False) -> bool:
 
     pool_codes = _get_pool_codes()
 
-    # ── 1. 获取服务器 ──
-    try:
-        ip, port = _get_server()
-    except Exception as e:
-        print(f"  [全市场] 获取通达信服务器失败: {e}")
-        return False
-
-    # ── 2. ETF列表 ──
+    # ── 1. ETF列表 ──
+    # 2026-10-23 改造: K线改走新浪后, 列表是唯一还依赖 pytdx 的环节。
+    # 列表拉不到时用已有缓存继续跑 (947 只足够动量发现), 不再整体 return False
+    # —— 原来 pytdx 一挂, 整个全市场缓存就静默停更了。
     etfs = _load_etf_list(CACHE_DB) if os.path.exists(CACHE_DB) else []
     if not etfs or _is_list_stale(CACHE_DB):
         try:
+            ip, port = _get_server()
             etfs = _fetch_all_etfs(ip, port)
             _save_etf_list(CACHE_DB, etfs)
         except Exception as e:
             if not etfs:
-                print(f"  [全市场] ETF列表拉取失败: {e}")
+                print(f"  [全市场] ETF列表不可用 ({type(e).__name__}), 跳过")
                 return False
-            print(f"  [全市场] ETF列表拉取失败, 使用缓存 ({len(etfs)} 只)")
+            print(f"  [全市场] ETF列表刷新失败, 沿用缓存 ({len(etfs)} 只)")
 
-    # ── 3. 增量K线 ──
+    # ── 2. K线 ──
     end_date = date.today()
     start_date = end_date - timedelta(days=90)
 
@@ -314,42 +357,69 @@ def update_etf_cache(force: bool = False) -> bool:
     external_etfs = [
         (c, n, m) for c, n, m in etfs if c not in pool_codes
     ]
-    print(f"  [全市场] 候选池外 {len(external_etfs)} 只ETF, 增量更新K线...")
+    print(f"  [全市场] 候选池外 {len(external_etfs)} 只ETF, 检查增量...")
+
+    start_str = start_date.strftime("%Y%m%d")
+    end_str = end_date.strftime("%Y%m%d")
+
+    # 一次性取出全部已缓存的最新日期 (原来每只单独开连接查, 947 次查询)
+    latest_map: dict[str, str] = {}
+    conn = sqlite3.connect(CACHE_DB)
+    try:
+        for c, d in conn.execute("SELECT code, MAX(date) FROM kline_data GROUP BY code"):
+            if d:
+                latest_map[c] = d
+    finally:
+        conn.close()
+
+    # 探针: 用一只ETF判断"市场最新交易日"。
+    # 新浪只提供到 T-1, 原来用 `latest >= 今天` 判断永远不成立 → 每天白拉 947 只。
+    market_latest = None
+    if external_etfs:
+        pc, _pn, pm = external_etfs[0]
+        probe = _fetch_kline_sina_range(pc, pm, start_str, end_str, adjust=False)
+        if probe:
+            market_latest = max(r["date"] for r in probe)
+
+    todo = []
+    for code, _name, market in external_etfs:
+        latest = latest_map.get(code)
+        if market_latest and latest and latest >= market_latest:
+            continue
+        fetch_start = (
+            (datetime.strptime(latest, "%Y%m%d").date() + timedelta(days=1)).strftime("%Y%m%d")
+            if latest else start_str
+        )
+        # 无缓存 → 首次建仓, 需要顺带做前复权
+        todo.append((code, market, fetch_start, latest is None))
+
+    print(f"  [全市场] 市场最新 {market_latest or '未知'}, 待更新 {len(todo)} 只")
+    if not todo:
+        print("  [全市场] 已是最新, 无需更新")
+        return True
 
     total_fetched = 0
-    api = TdxHq_API()
-    try:
-        if not api.connect(ip, port, time_out=10):
-            print("  [全市场] 连接服务器失败")
-            return False
 
-        for idx, (code, name, market) in enumerate(external_etfs):
-            latest = _get_latest_kline_date(CACHE_DB, code)
-            if latest and latest >= _today():
-                continue  # 已是最新
+    def _one(item):
+        code, market, fetch_start, need_adjust = item
+        rows = _fetch_kline_sina_range(code, market, fetch_start, end_str,
+                                       adjust=need_adjust)
+        _save_klines_batch(CACHE_DB, code, rows)
+        return len(rows)
 
-            fetch_start = (
-                datetime.strptime(latest, "%Y%m%d").date() + timedelta(days=1)
-                if latest else start_date
-            )
-            rows = _fetch_kline(
-                api, code, market,
-                fetch_start.strftime("%Y%m%d"),
-                end_date.strftime("%Y%m%d"),
-            )
-            _save_klines_batch(CACHE_DB, code, rows)
-            total_fetched += len(rows)
+    with ThreadPoolExecutor(max_workers=KLINE_WORKERS) as ex:
+        futs = {ex.submit(_one, it): it[0] for it in todo}
+        for i, fut in enumerate(as_completed(futs)):
+            try:
+                total_fetched += fut.result()
+            except Exception:
+                continue
+            if (i + 1) % 200 == 0:
+                print(f"      进度 {i+1}/{len(todo)}, 已获取 {total_fetched} 条")
 
-            if (idx + 1) % 200 == 0:
-                print(f"      进度 {idx+1}/{len(external_etfs)}, "
-                      f"已获取 {total_fetched} 条")
-
-            # 温和限速 (避免触发通达信流控)
-            time.sleep(0.03)
-    finally:
-        api.disconnect()
-
-    print(f"  [全市场] 增量获取 {total_fetched} 条K线, 完成")
+    if total_fetched == 0 and todo:
+        print(f"  [全市场] {len(todo)} 只待更新标的新浪无数据 (多为退市/长期停牌ETF), 已跳过")
+    print(f"  [全市场] 增量获取 {total_fetched} 条K线 (新浪), 完成")
     return True
 
 
