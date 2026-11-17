@@ -697,8 +697,15 @@ def _render_intraday(intraday):
     else:
         parts.append('<div>🟢 <span style="font-weight:600;color:#1d4ed8">申购:</span> 无</div>')
     if intraday.get("sell"):
-        names = "、".join(f"<b>{s['name']}</b>({s['fund_code']})" for s in intraday["sell"])
-        parts.append(f'<div>🔴 <span style="font-weight:600;color:#b91c1c">赎回:</span> {names}</div>')
+        # 带上真实触发原因 (缓冲内跌破MA20 / 动量转负 / 跌出缓冲), 别只写标的名
+        items = []
+        for s in intraday["sell"]:
+            reason = s.get("reason", "")
+            tail = (f' <span style="font-size:12px;color:#6b7280">— {reason}</span>'
+                    if reason else "")
+            items.append(f"<b>{s['name']}</b>({s['fund_code']}){tail}")
+        parts.append(f'<div>🔴 <span style="font-weight:600;color:#b91c1c">赎回:</span> '
+                     + "<br>".join(items) + '</div>')
     else:
         parts.append('<div>🔴 <span style="font-weight:600;color:#b91c1c">赎回:</span> 无</div>')
     locked_codes = {s["fund_code"] for s in intraday.get("locked", [])}
@@ -714,7 +721,8 @@ def _render_intraday(intraday):
     top_codes = intraday.get("top_codes", set())
     rank_rows = ""
     for r in intraday["rankings"]:
-        ma_flag = '<span style="color:#22c55e">上方</span>' if r["above_ma20"] else '<span style="color:#ef4444">下方</span>'
+        # A股口径涨红跌绿: MA20上方(多头/强)=红, 下方(空头/弱)=绿; 与同表动量/涨跌幅列一致
+        ma_flag = '<span style="color:#ef4444">上方</span>' if r["above_ma20"] else '<span style="color:#22c55e">下方</span>'
         star = "⭐" if r["etf_code"] in top_codes else ""
         pct_color = "#ef4444" if r["composite_score"] >= 0 else "#22c55e"
         chg_color = "#ef4444" if r["change_pct"] >= 0 else "#22c55e"
@@ -958,7 +966,7 @@ def generate_html(data):
         "#ef4444" if m.get("composite_score", 0) >= 0 else "#22c55e"
         for m in d["momentum"]
     ])
-    # MA20趋势状态: 上方=绿点, 下方=红点
+    # MA20趋势状态: 上方=红点(涨/强), 下方=绿点(跌/弱) — A股口径, 与全板涨跌色一致
     mom_ma20_status = json.dumps([
         "above" if m.get("above_ma20", 0) else "below"
         for m in d["momentum"]
@@ -1078,9 +1086,9 @@ def generate_html(data):
                 if h.get("status") == "pending_buy":
                     trail_html += '<br><span style="font-size:11px;color:#9ca3af">⏳ 份额待确认</span>'
                 elif h.get("above_ma20", 1) == 1:
-                    trail_html += '<br><span style="font-size:11px;color:#22c55e">🟢 MA20上方</span>'
+                    trail_html += '<br><span style="font-size:11px;color:#ef4444">🔴 MA20上方</span>'
                 else:
-                    trail_html += '<br><span style="font-size:11px;color:#ef4444;font-weight:600">🔴 MA20下方(趋势止损区)</span>'
+                    trail_html += '<br><span style="font-size:11px;color:#22c55e;font-weight:600">🟢 MA20下方(趋势止损区)</span>'
             rows_html += f'''
             <tr>
                 <td style="padding:10px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{h['etf_code']}">{h['name']}{watch_tag}</td>
@@ -1744,7 +1752,7 @@ new Chart(document.getElementById('momentumChart'), {{
                     afterBody: function(items) {{
                         var idx = items[0].dataIndex;
                         var ma20Status = {mom_ma20_status}[idx];
-                        return ma20Status === 'above' ? '🟢 MA20上方 (可买入)' : '🔴 MA20下方 (禁止买入)';
+                        return ma20Status === 'above' ? '🔴 MA20上方 (可买入)' : '🟢 MA20下方 (禁止买入)';
                     }}
                 }}
             }}

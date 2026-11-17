@@ -140,7 +140,8 @@ def main():
         print(f"  🔴 赎回:")
         for s in sell_signals:
             print(f"     → {s['name']} ({s['fund_code']})")
-            print(f"        排名第{s['rank']}, 持有{s['hold_days']}天 (已过7天锁), 跌出Top{ROTATION_HOLD_COUNT}")
+            print(f"        {s.get('reason', f'跌出Top{ROTATION_HOLD_COUNT}')}"
+                  f" · 持有{s['hold_days']}天 (已过赎回费/轮动锁)")
     else:
         print("  🔴 赎回: 无")
     if hold_signals:

@@ -112,6 +112,27 @@ MOMENTUM_MEDIUM = 30                    # 中期动量 (30日涨幅)
 MOMENTUM_WEIGHT_SHORT = 0.6             # 短期权重 (周期缩短后提高短期权重)
 MOMENTUM_WEIGHT_MEDIUM = 0.4            # 中期权重
 MOMENTUM_MIN_THRESHOLD = 0              # 动量最低门槛: 综合得分<=0的ETF不纳入轮动
+
+# ---- 动量持续性过滤 (2026-11-17 新增, 大树规则) ----
+# 背景: 原买入三重闸门(Top3 + 动量>0 + 收盘>MA20)只看当日快照, 等于追涨。
+# 机器人 020972 在 11-04~11-13 综合动量单日跳 8.9pp, 11-10 于反弹尖峰 +7.43%/#1
+# 发出买入信号, 买后 6 天转负、浮亏 -7.61%。故买入侧再加一层"动量是否持续"。
+# ⚠️ 只约束**新买入**, 不提前过滤 TopN / 不改变已持仓卖出判定 (与 MA20 闸门同原则)。
+# 三处共用 momentum_persistence.py: strategy / intraday_signal / backtest。
+MOMENTUM_PERSIST_ENABLED = True         # 总开关, False 可一键回退做 A/B
+MOMENTUM_PERSIST_MODE = "improve"       # "improve" | "consecutive" | "off"
+                                        # improve:     当日动量 >= N日前 + MIN_DELTA (拦"高位崩后小反弹")
+                                        # consecutive: 最近N日动量持续 > MOMENTUM_MIN_THRESHOLD (拦单日跳变)
+# 回看交易日数。2026-11-17 回测 A/B 选定 2 日:
+#   2日: 年化27.44% / 回撤9.04% / 142笔 / 胜率42.0%  ← 默认, 几乎不损收益且降回撤
+#   3日: 年化26.50% / 回撤9.81% / 150笔 / 胜率43.8%  ← 更保守, 能连申购日一起拦
+#   5日: 年化27.05% / 回撤9.01% / 154笔 / 胜率42.7%
+#   关闭: 年化27.54% / 回撤9.89% / 166笔 / 胜率39.5%
+# 2日已能拦住机器人 11-09 的信号发出日(当日+2.89% vs 2日前+9.23%), 那才是决策点;
+# 3日可连 11-10 申购日一起拦, 代价约 1pp 年化。要更严就把这里改成 3。
+MOMENTUM_PERSIST_LOOKBACK = 2
+MOMENTUM_PERSIST_MIN_DELTA = 0.0        # improve 模式要求的最小改善幅度 (百分点)
+
 ROTATION_HOLD_COUNT = 3                 # 基础目标持仓数 (买入名单 = 动量Top3)
 ROTATION_CYCLE_DAYS = 7                 # 轮动周期 (天). 2026-11-05 由 14 改 7:
                                         # 用户决定取消"跌出Top3需持有满14天"的缓冲,
@@ -224,7 +245,16 @@ def _load_custom_etfs():
         valid = []
         for item in custom:
             if all(k in item for k in ("code", "name", "fund_code", "category")):
-                valid.append(item)
+                # 显示名统一为场内ETF简称: 历史 add-etf 曾手填平台全称"XXETF联接A",
+                # 与 config 内置 14 只的"XXETF"口径不一致, 看板实时行情/动量排名会混着显示。
+                # 份额类别由 fund_code 区分, 名称不必带后缀; efunds_sync.build_name_map()
+                # 本就会剥掉这些后缀做模糊匹配, 对账不受影响。
+                _nm = str(item.get("name", ""))
+                for _suf in ("联接A", "联接B", "联接C", "联接D", "联接E", "联接"):
+                    if _nm.endswith("ETF" + _suf):
+                        _nm = _nm[: -len(_suf)]
+                        break
+                valid.append({**item, "name": _nm})
             else:
                 print(f"[CONFIG] 跳过无效自定义ETF: {item}")
         return valid

@@ -23,11 +23,14 @@ from config import (
     MOMENTUM_SHORT, MOMENTUM_MEDIUM,
     MOMENTUM_WEIGHT_SHORT, MOMENTUM_WEIGHT_MEDIUM,
     MOMENTUM_MIN_THRESHOLD, ROTATION_HOLD_COUNT, MIN_HOLD_DAYS,
+    MOMENTUM_PERSIST_ENABLED, MOMENTUM_PERSIST_MODE,
+    MOMENTUM_PERSIST_LOOKBACK, MOMENTUM_PERSIST_MIN_DELTA,
     ROTATION_CYCLE_DAYS, MIN_POSITION_VALUE,
     ROTATION_RANK_BUFFER, ROTATION_MAX_HOLD_COUNT,
 )
 from db import get_connection
 from tdx_data import get_realtime_quotes
+from momentum_persistence import check_persistence
 
 # 交易时段窗口 (建议运行时间)
 RECOMMEND_START = datetime.strptime("14:30", "%H:%M").time()
@@ -76,12 +79,23 @@ def compute_momentum(closes, price):
         ma20 = sum(series[-20:]) / 20
         above_ma20 = series[-1] > ma20
 
+    # 动量持续性过滤 (2026-11-17): 与 strategy / backtest 共用同一模块, 口径一致
+    persist_ok, persist_info = check_persistence(
+        series,
+        enabled=MOMENTUM_PERSIST_ENABLED,
+        mode=MOMENTUM_PERSIST_MODE,
+        lookback=MOMENTUM_PERSIST_LOOKBACK,
+        min_delta=MOMENTUM_PERSIST_MIN_DELTA,
+    )
+
     return {
         "momentum_10d": round(mom_short, 4),
         "momentum_30d": round(mom_medium, 4),
         "composite_score": round(mom_short * MOMENTUM_WEIGHT_SHORT + mom_medium * MOMENTUM_WEIGHT_MEDIUM, 4),
         "ma20": round(ma20, 4) if ma20 else None,
         "above_ma20": above_ma20,
+        "persist_ok": persist_ok,
+        "persist_info": persist_info.get("reason", ""),
     }
 
 
@@ -307,13 +321,19 @@ def generate_signals(codes=None, holdings_arg=None):
     else:
         buy_slots = 0
 
+    persist_skipped = []
     for r in momentum_top:
         if buy_slots <= 0:
             break
-        # 买入闸门: 未持有 + MA20上方 (综合得分>0 已由 momentum_top 过滤)
-        if r["etf_code"] not in holdings and r["above_ma20"]:
-            buy_slots -= 1
-            buy_signals.append(r)
+        # 买入闸门: 未持有 + MA20上方 + 动量持续性 (综合得分>0 已由 momentum_top 过滤)
+        if r["etf_code"] in holdings or not r["above_ma20"]:
+            continue
+        if MOMENTUM_PERSIST_ENABLED and not r.get("persist_ok", True):
+            persist_skipped.append({"name": r["name"], "fund_code": r["fund_code"],
+                                    "reason": r.get("persist_info", "")})
+            continue
+        buy_slots -= 1
+        buy_signals.append(r)
 
     for code, h in holdings.items():
         # 该持仓是否还在候选池 (可能已不在 SATELLITE_ETFS)
@@ -351,8 +371,22 @@ def generate_signals(codes=None, holdings_arg=None):
                                      "rank": row["rank"],
                                      "reason": f"跌出Top{buffer_limit}缓冲区或动量/趋势转弱, 但持有仅{hold_days}天 (需满{need_days}天), 暂不赎回"})
             else:
+                # 卖出原因必须写清楚: Top5缓冲生效后, "跌出Top3"不再是唯一理由 —
+                # 缓冲内但不健康(动量转负/跌破MA20)同样触发赎回。旧文案一律写
+                # "跌出Top3"会让人误以为缓冲没生效 (2026-11-13 实测创新药 #4)。
+                if row["rank"] > buffer_limit:
+                    reason = f"动量第{row['rank']}, 跌出Top{buffer_limit}缓冲区"
+                else:
+                    bits = []
+                    if row["composite_score"] <= MOMENTUM_MIN_THRESHOLD:
+                        bits.append(f"动量转负({row['composite_score']:+.2f}%)")
+                    if not row["above_ma20"]:
+                        bits.append("跌破MA20")
+                    reason = (f"动量第{row['rank']}, 在Top{buffer_limit}缓冲区内但"
+                              + "/".join(bits or ["趋势转弱"]) + ", 缓冲保护失效")
                 sell_signals.append({"name": h["name"], "fund_code": h["fund_code"],
-                                     "rank": row["rank"], "hold_days": hold_days})
+                                     "rank": row["rank"], "hold_days": hold_days,
+                                     "reason": reason})
 
     return {
         "ok": True,
@@ -363,6 +397,7 @@ def generate_signals(codes=None, holdings_arg=None):
         "rankings": rows,
         "top_codes": top_codes,
         "top_n": momentum_top,
+        "persist_skipped": persist_skipped,
         "buy": buy_signals,
         "sell": sell_signals,
         "hold": hold_signals,

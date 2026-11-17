@@ -5,12 +5,15 @@
 import pandas as pd
 from datetime import datetime, timedelta
 from db import get_connection
+from momentum_persistence import check_persistence
 from config import (
     # 宽基PE择时
     PE_LOOKBACK_YEARS, PE_BUY_THRESHOLD, PE_SELL_THRESHOLD, MA_PERIOD,
     # 动量轮动
     MOMENTUM_SHORT, MOMENTUM_MEDIUM, MOMENTUM_WEIGHT_SHORT, MOMENTUM_WEIGHT_MEDIUM,
     MOMENTUM_MIN_THRESHOLD,
+    MOMENTUM_PERSIST_ENABLED, MOMENTUM_PERSIST_MODE,
+    MOMENTUM_PERSIST_LOOKBACK, MOMENTUM_PERSIST_MIN_DELTA,
     ROTATION_HOLD_COUNT, ROTATION_CYCLE_DAYS,
     ROTATION_RANK_BUFFER, ROTATION_MAX_HOLD_COUNT,
     # 移动止盈 + 止损
@@ -446,6 +449,10 @@ def check_rotation_signals(holdings):
         if row["etf_code"] not in current_codes:
             if "above_ma20" in row.index and not row["above_ma20"]:
                 print(f"    [SKIP] {row['name']} 动量Top{ROTATION_HOLD_COUNT}但收盘在MA20下方, 不满足买入闸门")
+                continue
+            # 动量持续性闸门 (2026-11-17): 拦住反弹尖峰/动量从高位掉下来的假信号
+            if MOMENTUM_PERSIST_ENABLED and "persist_ok" in row.index and not row["persist_ok"]:
+                print(f"    [SKIP] {row['name']} 动量持续性不足: {row.get('persist_info', '')}")
                 continue
             buy_slots -= 1
             buy_signals.append({
@@ -1027,9 +1034,20 @@ def _calc_single_momentum(ts_code, conn):
         ma20 = round(sum(closes[-20:]) / 20, 4)
         above_ma20 = closes[-1] > ma20
 
+    # 动量持续性过滤 (2026-11-17): 只约束新买入, 不影响排名/卖出判定
+    persist_ok, persist_info = check_persistence(
+        closes,
+        enabled=MOMENTUM_PERSIST_ENABLED,
+        mode=MOMENTUM_PERSIST_MODE,
+        lookback=MOMENTUM_PERSIST_LOOKBACK,
+        min_delta=MOMENTUM_PERSIST_MIN_DELTA,
+    )
+
     return {
         "momentum_20d": round(momentum_20d, 4),
         "momentum_60d": round(momentum_60d, 4),
         "ma20": ma20,
         "above_ma20": above_ma20,
+        "persist_ok": persist_ok,
+        "persist_info": persist_info.get("reason", ""),
     }
