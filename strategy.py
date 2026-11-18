@@ -387,7 +387,8 @@ def check_rotation_signals(holdings):
     """
     momentum_df = calc_momentum_scores()
     if momentum_df.empty:
-        return {"buy": [], "sell": [], "hold": [], "momentum_df": momentum_df, "top_codes": set()}
+        return {"buy": [], "sell": [], "hold": [], "momentum_df": momentum_df,
+                "top_codes": set(), "top1_code": None}
 
     # 动量门槛过滤: 综合得分 <= 0 的ETF不纳入轮动
     eligible = momentum_df[momentum_df["composite_score"] > MOMENTUM_MIN_THRESHOLD].copy()
@@ -397,6 +398,11 @@ def check_rotation_signals(holdings):
     #       跌破MA20"的持仓 (如黄金ETF动量#3却因MA20下方被误判跌出前N建议赎回)
     top_n = eligible.head(ROTATION_HOLD_COUNT)
     top_codes = set(top_n["etf_code"].tolist())
+    # 真·动量第1名 (2026-11-18 P0-3): 移动止盈的 8% 宽限只应给最强的那一只。
+    # 旧实现把这个 top_codes(Top3全体) 传给 check_stop_signals, 与回测
+    # backtest.py 的 eligible_scores[0][0] 口径分裂, 导致 11-13 机器人(#2)
+    # 回撤 6.21pp 被 8% 宽限放过。
+    top1_code = top_n.iloc[0]["etf_code"] if not top_n.empty else None
     # 排名缓冲区: 持仓跌出 Top3 后, 仍在 Top(HOLD+BUFFER) 内且健康 → 继续持有不卖
     buffer_limit = ROTATION_HOLD_COUNT + ROTATION_RANK_BUFFER
 
@@ -415,7 +421,8 @@ def check_rotation_signals(holdings):
                     "direction": "hold",
                     "reason": "所有候选ETF动量不足, 继续持有"
                 })
-        return {"buy": [], "sell": [], "hold": hold_signals, "momentum_df": momentum_df, "top_codes": top_codes}
+        return {"buy": [], "sell": [], "hold": hold_signals, "momentum_df": momentum_df,
+                "top_codes": top_codes, "top1_code": top1_code}
 
     current_codes = {h["etf_code"] for h in holdings if h["category"] == "satellite"}
 
@@ -576,7 +583,8 @@ def check_rotation_signals(holdings):
                 "reason": f"动量排名第{rank_row['rank']}, 继续持有"
             })
 
-    return {"buy": buy_signals, "sell": sell_signals, "hold": hold_signals, "momentum_df": momentum_df, "top_codes": top_codes}
+    return {"buy": buy_signals, "sell": sell_signals, "hold": hold_signals,
+            "momentum_df": momentum_df, "top_codes": top_codes, "top1_code": top1_code}
 
 
 # ============================================================
@@ -614,7 +622,29 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
         profit_pct = h.get("profit_pct", 0)
         hold_days = h.get("hold_days", 0)
 
-        # 最短持有期检查
+        # === 峰值跟踪 (2026-11-18 P0-1) ===
+        # 🔴 峰值「记账」必须与「能不能卖」解耦: 7天赎回费锁内虽然不能赎回, 但
+        #    盈利峰值依然要入库。旧实现把峰值更新放在 `hold_days < 7 and profit_pct > 0`
+        #    的 continue 之后, 导致锁内急涨的峰值永久丢失 —— 解锁时浮盈已回落,
+        #    peak 恒为 0, 移动止盈再也不会激活。实证: 机器人 020972 于 11-10 申购 /
+        #    11-11 确认, 11-11 净值 1.3646 浮盈 +9.05%(持有1天) 未记峰值, 11-17
+        #    解锁时已 -4.11%, 最终只能靠 MA20 趋势止损兜底。
+        #    持有期只约束下面的「是否生成卖出信号」, 不再影响记账。
+        # 宽基不走移动止盈, 不记峰值(记了也不会用); 观察仓/在途已在上面排除。
+        peak_profit = h.get("peak_profit_pct") or 0
+        if (h.get("category") != "core"
+                and profit_pct >= TRAILING_STOP_ACTIVATE
+                and profit_pct > peak_profit):
+            peak_profit = profit_pct
+            if h.get("id"):
+                # 立即单独落库: 万一后面的 MA20 查询/卖出判定抛异常, 峰值也不会
+                # 被同一事务回滚掉 (这正是「记账与判定解耦」的最后一层)。
+                conn.execute("UPDATE portfolio SET peak_profit_pct = ? WHERE id = ?",
+                             (peak_profit, h["id"]))
+                conn.commit()
+                peak_updates.append((peak_profit, h["id"]))
+
+        # 最短持有期检查 (只约束卖出信号, 不影响上面的峰值记账)
         if hold_days < MIN_HOLD_DAYS and profit_pct > 0:
             continue
 
@@ -644,15 +674,7 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
         else:
             etf_pullback = trailing_pullback
 
-        # === 移动止盈 ===
-        peak_profit = h.get("peak_profit_pct") or 0
-
-        # 利润≥激活阈值且创新高 → 更新峰值并持久化
-        if profit_pct >= TRAILING_STOP_ACTIVATE and profit_pct > peak_profit:
-            peak_profit = profit_pct
-            if h.get("id"):
-                peak_updates.append((peak_profit, h["id"]))
-
+        # === 移动止盈 (峰值已在循环开头无条件记账, 这里只做回撤判定) ===
         # 从峰值回撤超过阈值 → 清仓信号
         if peak_profit > 0 and (peak_profit - profit_pct) >= etf_pullback:
             signals.append({
@@ -662,7 +684,8 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
                 "category": h["category"],
                 "direction": "sell",
                 "signal_type": "trailing_stop",
-                "reason": f"移动止盈: 峰值+{peak_profit:.2f}%, 回撤至+{profit_pct:.2f}% (回撤{peak_profit - profit_pct:.2f}%, 阈值{etf_pullback:.0f}%)",
+                "reason": (f"移动止盈: 峰值+{peak_profit:.2f}%, 现{profit_pct:+.2f}%, "
+                           f"回撤{peak_profit - profit_pct:.2f}pp ≥ {etf_pullback:.0f}pp"),
                 "profit_pct": profit_pct,
                 "peak_profit_pct": peak_profit,
                 "sell_ratio": 1.0,
@@ -706,11 +729,8 @@ def check_stop_signals(holdings, is_panic=False, momentum_top_codes=None):
                 "priority": "urgent" if is_panic else "high"
             })
 
-    # 批量更新峰值到数据库
+    # 峰值已在循环里即时落库, 这里只报告数量
     if peak_updates:
-        for peak_val, hid in peak_updates:
-            conn.execute("UPDATE portfolio SET peak_profit_pct = ? WHERE id = ?", (peak_val, hid))
-        conn.commit()
         print(f"  [OK] 利润峰值更新: {len(peak_updates)}只持仓")
 
     conn.close()

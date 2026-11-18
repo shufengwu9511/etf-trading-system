@@ -138,9 +138,13 @@ def main():
         print("  🟢 申购: 无")
     if sell_signals:
         print(f"  🔴 赎回:")
+        stop_tags = {"trailing_stop": "移动止盈", "trend_stop": "趋势止损",
+                     "stop_loss": "固定止损"}
         for s in sell_signals:
+            tag = stop_tags.get(s.get("signal_type"))
+            label = f"[{tag}] " if tag else ""
             print(f"     → {s['name']} ({s['fund_code']})")
-            print(f"        {s.get('reason', f'跌出Top{ROTATION_HOLD_COUNT}')}"
+            print(f"        {label}{s.get('reason', f'跌出Top{ROTATION_HOLD_COUNT}')}"
                   f" · 持有{s['hold_days']}天 (已过赎回费/轮动锁)")
     else:
         print("  🔴 赎回: 无")
@@ -151,6 +155,11 @@ def main():
 
     # 只显示信号, 不修改任何状态 (持仓以主系统数据库为准)
     print("")
+    print(f"  [INFO] 恐慌状态: {'是(阈值已收紧)' if result.get('is_panic') else '否'}"
+          f" · 来源: {result.get('panic_source', '-')}")
+    print("  [INFO] 赎回判定已含移动止盈/MA20趋势止损/固定止损 (与盘后同口径, 浮盈为盘中估算)")
+    for w in result.get("data_warnings", []):
+        print(f"  [WARN] {w}")
     print("  [INFO] 脚本只显示信号, 不自动记账; 实际申赎请在持仓系统(main.py)中维护")
     print("  [INFO] 同一份信号已集成到主看板 logs/dashboard.html, 更新看板时自动计算")
 

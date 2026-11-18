@@ -607,7 +607,7 @@ def _render_action(action, panic):
             <h4 style="font-size:15px;color:#374151;margin-bottom:8px">🔄 行业ETF动量轮动</h4>
             <div style="font-size:12px;color:#6b7280;margin-bottom:8px">
                 <span style="font-weight:600;color:#1e40af">买入闸门(四重全满足):</span> ① 动量Top3 ② 复合动量&gt;0 ③ 收盘价在MA20上方 ④ 动量持续性(回看2日窗口内每日动量均&gt;0 且当日≥2日前; 只约束新买入) &nbsp;|&nbsp;
-                <span style="font-weight:600;color:#991b1b">卖出防线(任一触发):</span> ① 移动止盈(8%激活/6%回撤) ② MA20×0.95趋势止损 ③ 固定止损(-15%) ④ 跌出Top5缓冲区 或 动量转负/跌破MA20(持有满7天即可卖) &nbsp;|&nbsp; <span style="font-weight:600;color:#1e40af">持仓:</span> 基础Top3, 全部持仓仍向上时可超额至5只
+                <span style="font-weight:600;color:#991b1b">卖出防线(任一触发):</span> ① 移动止盈(8%激活/6%回撤, 真Top1容限8%) ② MA20×0.95趋势止损 ③ 固定止损(-15%) ④ 跌出Top5缓冲区 或 动量转负/跌破MA20(持有满7天即可卖) &nbsp;|&nbsp; <span style="font-weight:600;color:#1e40af">持仓:</span> 基础Top3, 全部持仓仍向上时可超额至5只
             </div>
             {'<table style="width:100%;margin-bottom:8px"><thead><tr><th>信号日期</th><th>标的</th><th>基金代码</th><th>金额</th><th>原因</th></tr></thead><tbody>' + buy_rows + '</tbody></table>' if rot_buy else ''}
             {'<table style="width:100%"><thead><tr><th>信号日期</th><th>标的</th><th>基金代码</th><th>金额</th><th>原因</th></tr></thead><tbody>' + sell_rows + '</tbody></table>' if rot_sell else ''}
@@ -722,13 +722,19 @@ def _render_intraday(intraday):
     else:
         parts.append('<div>🟢 <span style="font-weight:600;color:#1d4ed8">申购:</span> 无</div>')
     if intraday.get("sell"):
-        # 带上真实触发原因 (缓冲内跌破MA20 / 动量转负 / 跌出缓冲), 别只写标的名
+        # 带上真实触发原因: 轮动(缓冲内跌破MA20/动量转负/跌出缓冲) 或
+        # 2026-11-18 P0-2 新纳入的移动止盈/趋势止损/固定止损
+        stop_tags = {"trailing_stop": "移动止盈", "trend_stop": "趋势止损",
+                     "stop_loss": "固定止损"}
         items = []
         for s in intraday["sell"]:
             reason = s.get("reason", "")
             tail = (f' <span style="font-size:12px;color:#6b7280">— {reason}</span>'
                     if reason else "")
-            items.append(f"<b>{s['name']}</b>({s['fund_code']}){tail}")
+            tag = stop_tags.get(s.get("signal_type"))
+            badge = (f' <span style="font-size:11px;padding:1px 5px;border-radius:4px;'
+                     f'background:#fee2e2;color:#991b1b">[{tag}]</span>' if tag else "")
+            items.append(f"<b>{s['name']}</b>({s['fund_code']}){badge}{tail}")
         parts.append(f'<div>🔴 <span style="font-weight:600;color:#b91c1c">赎回:</span> '
                      + "<br>".join(items) + '</div>')
     else:
@@ -740,6 +746,9 @@ def _render_intraday(intraday):
             lock = "🔒" if s["fund_code"] in locked_codes else ""
             hold_names.append(f"{s['name']}({s['fund_code']}){lock}")
         parts.append(f'<div>⚪ <span style="font-weight:600;color:#6b7280">持有:</span> {"、".join(hold_names)}</div>')
+    # 2026-11-18 P0-2: 净值滞后会让盘中止盈止损的浮盈估算失真, 显式提示
+    for w in intraday.get("data_warnings", []):
+        parts.append(f'<div style="color:#b91c1c;font-size:12px">⚠️ {w}</div>')
     action_html = "<br>".join(parts)
 
     # 动量排名表

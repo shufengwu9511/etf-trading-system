@@ -140,8 +140,13 @@ def run_daily():
     # 3c: 止盈止损
     print("  [3c] 止盈止损检查...")
     try:
-        # 传入动量排名前N的ETF代码, 行业ETF在其中的跳过止盈(让利润奔跑)
-        momentum_top_codes = rotation_result.get("top_codes", set())
+        # 移动止盈的 8% 宽限只给真·动量第1名 (2026-11-18 P0-3)。
+        # 旧注释「传入前N、行业ETF在其中跳过止盈(让利润奔跑)」与实现不符:
+        # 代码从不跳过止盈, 只是把回撤容限从 6% 放宽到 8%; 且旧实现传的是
+        # top_codes = eligible.head(3) = Top3 全体, 比回测(真Top1)宽松得多,
+        # 实证 11-13 机器人(#2) 回撤 6.21pp 被 8% 宽限放过。这里收回 Top1。
+        top1_code = rotation_result.get("top1_code")
+        momentum_top_codes = {top1_code} if top1_code else set()
         stop_signals = check_stop_signals(holdings, is_panic=panic_alert.get("is_panic", False),
                                           momentum_top_codes=momentum_top_codes)
         if stop_signals:

@@ -28,6 +28,11 @@ from config import (
     MOMENTUM_PERSIST_REQUIRE_POSITIVE,
     ROTATION_CYCLE_DAYS, MIN_POSITION_VALUE,
     ROTATION_RANK_BUFFER, ROTATION_MAX_HOLD_COUNT,
+    # 2026-11-18 P0-2: 盘中补齐止盈/止损判定, 与 strategy.check_stop_signals 同参数
+    TRAILING_STOP_ACTIVATE, TRAILING_STOP_PULLBACK,
+    TRAILING_STOP_PANIC_PULLBACK, TRAILING_STOP_TOP1_PULLBACK,
+    STOP_LOSS_THRESHOLD, STOP_LOSS_PANIC_THRESHOLD,
+    MA20_STOP_LOSS_RATIO,
 )
 from db import get_connection
 from tdx_data import get_realtime_quotes
@@ -149,7 +154,10 @@ def sync_holdings_from_portfolio():
     conn = get_connection()
     rows = conn.execute("""
         SELECT fund_code, etf_code, name, confirm_date, buy_date, status,
-               COALESCE(market_value, 0) AS market_value
+               COALESCE(market_value, 0) AS market_value,
+               COALESCE(profit_pct, 0) AS profit_pct,
+               COALESCE(peak_profit_pct, 0) AS peak_profit_pct,
+               nav_date
         FROM portfolio
         WHERE status IN ('holding', 'pending_buy') AND category = 'satellite'
     """).fetchall()
@@ -170,6 +178,11 @@ def sync_holdings_from_portfolio():
             "name": r["name"],
             "buy_date": buy_date,
             "status": r["status"],
+            # 2026-11-18 P0-2: 盘中止盈/止损要用 DB 里的浮盈与峰值(基于 T-1 场外净值),
+            # 再用当日场内涨跌幅做增量修正。nav_date 用于识别净值滞后。
+            "profit_pct": float(r["profit_pct"] or 0),
+            "peak_profit_pct": float(r["peak_profit_pct"] or 0),
+            "nav_date": r["nav_date"],
         }
     return result
 
@@ -216,21 +229,97 @@ def _row_healthy(r):
 
 
 # ============================================================
+# 止盈止损 (2026-11-18 P0-2)
+# 旧版盘中信号只有轮动类卖出, 14:40 这个场外申赎唯一决策窗口看不到
+# 移动止盈/趋势止损/固定止损 → 只能等盘后 main.py, 再 T+1 提交, 结构性滑一天。
+# ============================================================
+
+def _read_panic_state(today_str):
+    """读取当日最新一次恐慌判定, 返回 (is_panic, 当日有无记录)。
+
+    盘中不重算恐慌指标(要抓全市场快照/跌停家数, 成本高), 直接复用主流程
+    当天已落库的 panic_alerts。当日无记录则按非恐慌处理, 结果里会标注来源。
+    与主流程完全一致的实时判定仍以当晚 main.py 为准。
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT alert_level FROM panic_alerts
+            WHERE trade_date = ? ORDER BY id DESC LIMIT 1
+        """, (today_str,)).fetchone()
+    finally:
+        conn.close()
+    return bool(row and row["alert_level"] == "PANIC"), bool(row)
+
+
+def _check_intraday_stop(h, row, profit_pct, hold_days, is_panic, top1_code):
+    """盘中版单持仓止盈止损判定, 与 strategy.check_stop_signals 同口径/同优先级。
+
+    判定顺序: 移动止盈 → MA20趋势止损 → 固定止损, 命中即返回一条卖出信号。
+    刻意保留的差异:
+      · 盘中不写库。峰值只在本次估算里用 max(库内峰值, 当日新高), 记账由当晚
+        main.py 负责(P0-1 已保证锁内也会记)。
+      · 浮盈 = DB(T-1 场外净值) × 当日场内涨跌幅, 是估算值, reason 明确标注。
+    """
+    code = h["etf_code"]
+    # 与盘后一致: 7天赎回费锁内且仍盈利 → 不产生任何卖出信号
+    if hold_days < MIN_HOLD_DAYS and profit_pct > 0:
+        return None
+
+    stop_loss = abs(STOP_LOSS_PANIC_THRESHOLD if is_panic else STOP_LOSS_THRESHOLD)
+    pullback = TRAILING_STOP_PANIC_PULLBACK if is_panic else TRAILING_STOP_PULLBACK
+    # 8% 宽限只给真·动量第1名 (P0-3 口径)
+    if top1_code and code == top1_code and not is_panic:
+        pullback = TRAILING_STOP_TOP1_PULLBACK
+
+    peak = h.get("peak_profit_pct") or 0
+    if profit_pct >= TRAILING_STOP_ACTIVATE and profit_pct > peak:
+        peak = profit_pct
+
+    base = {"name": h["name"], "fund_code": h["fund_code"],
+            "rank": row.get("rank"), "hold_days": hold_days,
+            "direction": "sell", "profit_pct": round(profit_pct, 2),
+            "priority": "urgent" if is_panic else "high"}
+
+    if peak > 0 and (peak - profit_pct) >= pullback:
+        return {**base, "signal_type": "trailing_stop",
+                "reason": (f"移动止盈(盘中估算): 峰值+{peak:.2f}%, 现约{profit_pct:+.2f}%, "
+                           f"回撤{peak - profit_pct:.2f}pp ≥ {pullback:.0f}pp"
+                           + (" [恐慌加急]" if is_panic else ""))}
+
+    ma20, price = row.get("ma20"), row.get("price")
+    if hold_days >= MIN_HOLD_DAYS and ma20 and price:
+        if price < ma20 * MA20_STOP_LOSS_RATIO:
+            below = (price / ma20 - 1) * 100
+            return {**base, "signal_type": "trend_stop",
+                    "reason": (f"趋势止损: 现价{price:.4f} < MA20×{MA20_STOP_LOSS_RATIO}"
+                               f"({ma20 * MA20_STOP_LOSS_RATIO:.4f}), 跌破{below:.2f}%")}
+
+    if profit_pct <= -stop_loss:
+        return {**base, "signal_type": "stop_loss",
+                "reason": (f"{'[恐慌加急] ' if is_panic else ''}止损: 盘中估算浮亏{profit_pct:.2f}% "
+                           f"(阈值-{stop_loss:.0f}%)")}
+    return None
+
+
+# ============================================================
 # 主计算入口
 # ============================================================
 
-def generate_signals(codes=None, holdings_arg=None):
+def generate_signals(codes=None, holdings_arg=None, is_panic=None):
     """计算盘中信号 (现价代理收盘价), 返回结构化结果 dict
 
     Args:
         codes: 逗号分隔的场内ETF代码, 仅计算指定ETF (默认全部卫星池)
         holdings_arg: 手动声明持仓 "基金代码:买入日期YYYYMMDD,..."
                       (仅在数据库无持仓时生效)
+        is_panic: 恐慌状态。None = 读当日 panic_alerts; 显式 bool 可覆盖。
 
     Returns:
         {"ok": True, "generated_at", "in_recommend_window", "is_weekend",
          "rankings": [...], "top_n": [...],
-         "buy": [...], "sell": [...], "hold": [...], "locked": [...]}
+         "buy": [...], "sell": [...], "hold": [...], "locked": [...],
+         "is_panic", "panic_source", "top1_code", "data_warnings": [...]}
         失败时返回 {"ok": False, "error": "..."}
     """
     today = datetime.now()
@@ -296,11 +385,34 @@ def generate_signals(codes=None, holdings_arg=None):
     state = init_holdings_state(holdings_arg)
     holdings = state.get("holdings", {})
 
+    # 5b. 恐慌状态 + 净值新鲜度 (2026-11-18 P0-2)
+    if is_panic is None:
+        panic_state, has_record = _read_panic_state(today_str)
+        panic_source = "当日 panic_alerts" if has_record else "当日无恐慌记录(按正常处理)"
+    else:
+        panic_state, panic_source = bool(is_panic), "调用方指定"
+
+    data_warnings = []
+    for _h in holdings.values():
+        nav_date = str(_h.get("nav_date") or "").replace("-", "")
+        if len(nav_date) == 8:
+            try:
+                lag = (today - datetime.strptime(nav_date, "%Y%m%d")).days
+            except ValueError:
+                continue
+            if lag > 4:
+                data_warnings.append(
+                    f"{_h['name']} 净值停留在 {nav_date} (滞后{lag}天), "
+                    f"盘中止盈止损的浮盈估算可能失真, 请先跑 main.py 刷新净值")
+                break
+
     # 6. 生成信号
     # 卖出判定TopN = 纯动量前N (MA20只约束买入, 不提前过滤进TopN,
     # 否则动量Top3内但当日跌破MA20的持仓会被误判"跌出前N", 与主系统修复后一致)
     momentum_top = [r for r in rows if r["composite_score"] > MOMENTUM_MIN_THRESHOLD][:ROTATION_HOLD_COUNT]
     top_codes = {r["etf_code"] for r in momentum_top}
+    # 真·动量第1名: 8% 移动止盈宽限只给这一只 (P0-3 与盘后/回测对齐)
+    top1_code = momentum_top[0]["etf_code"] if momentum_top else None
     buffer_limit = ROTATION_HOLD_COUNT + ROTATION_RANK_BUFFER
     row_by_code = {r["etf_code"]: r for r in rows}
 
@@ -344,6 +456,30 @@ def generate_signals(codes=None, holdings_arg=None):
             hold_signals.append({"name": h["name"], "fund_code": h["fund_code"],
                                  "reason": "不在候选池, 保持现状"})
             continue
+
+        # 持有期统一在循环开头算, 止盈止损与轮动共用同一把尺子
+        hold_days = calc_hold_days(h.get("buy_date", ""))
+        need_days = max(MIN_HOLD_DAYS, ROTATION_CYCLE_DAYS)
+
+        # --- 2026-11-18 P0-2: 止盈/止损优先于轮动, 与盘后同优先级 ---
+        # 浮盈 = DB(T-1 场外净值) 复利叠加当日场内涨跌幅 → 当日净值的盘中估算。
+        chg = float(row.get("change_pct") or 0)
+        profit_pct = ((1 + (h.get("profit_pct") or 0) / 100) * (1 + chg / 100) - 1) * 100
+        stop_sig = _check_intraday_stop(h, row, profit_pct, hold_days,
+                                        panic_state, top1_code)
+        if stop_sig:
+            # 赎回费锁未解 → 只登记不喊卖, 避免与主流程指令分裂
+            if hold_days < need_days:
+                locked.append({"name": h["name"], "fund_code": h["fund_code"],
+                               "rank": row["rank"], "hold_days": hold_days})
+                hold_signals.append({"name": h["name"], "fund_code": h["fund_code"],
+                                     "rank": row["rank"],
+                                     "reason": f"{stop_sig['reason']}, 但持有仅{hold_days}天"
+                                               f" (需满{need_days}天), 暂不赎回"})
+                continue
+            sell_signals.append(stop_sig)
+            continue
+
         if code in top_codes:
             hold_signals.append({"name": h["name"], "fund_code": h["fund_code"],
                                  "rank": row["rank"],
@@ -358,14 +494,11 @@ def generate_signals(codes=None, holdings_arg=None):
                                                 f"(跌出Top{ROTATION_HOLD_COUNT}不硬切), 动量>0且MA20上方, 继续持有")})
                 continue
 
-            hold_days = calc_hold_days(h.get("buy_date", ""))
             # 卖出门槛必须与主流程 strategy.py 保持一致: 跌出 TopN 后, 持有满
             # ROTATION_CYCLE_DAYS 即可赎回。2026-11-05 用户取消 14 天缓冲,
             # ROTATION_CYCLE_DAYS 已改 7 (与 MIN_HOLD_DAYS 赎回费锁相等),
-            # 所以现在"过 7 天就能卖"。历史上这里曾只判 MIN_HOLD_DAYS(7) 而
-            # 主流程判 14, 导致盘中比主流程提前一周喊卖; 用 max() 兜住两边,
-            # 将来任一常量变动都不会再出现口径分裂。
-            need_days = max(MIN_HOLD_DAYS, ROTATION_CYCLE_DAYS)
+            # 所以现在"过 7 天就能卖"。hold_days / need_days 已在循环开头统一算,
+            # 盘中止盈止损也用同一把尺子, 不再出现「盘中喊卖、主流程锁着」的分裂。
             if hold_days < need_days:
                 locked.append({"name": h["name"], "fund_code": h["fund_code"],
                                "rank": row["rank"], "hold_days": hold_days})
@@ -400,6 +533,10 @@ def generate_signals(codes=None, holdings_arg=None):
         "top_codes": top_codes,
         "top_n": momentum_top,
         "persist_skipped": persist_skipped,
+        "is_panic": panic_state,
+        "panic_source": panic_source,
+        "top1_code": top1_code,
+        "data_warnings": data_warnings,
         "buy": buy_signals,
         "sell": sell_signals,
         "hold": hold_signals,
