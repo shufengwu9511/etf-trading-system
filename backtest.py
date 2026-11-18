@@ -24,6 +24,7 @@ from config import (
     MOMENTUM_MIN_THRESHOLD,
     MOMENTUM_PERSIST_ENABLED, MOMENTUM_PERSIST_MODE,
     MOMENTUM_PERSIST_LOOKBACK, MOMENTUM_PERSIST_MIN_DELTA,
+    MOMENTUM_PERSIST_REQUIRE_POSITIVE,
     ROTATION_HOLD_COUNT, ROTATION_CYCLE_DAYS,
     ROTATION_RANK_BUFFER, ROTATION_MAX_HOLD_COUNT,
     STOP_LOSS_THRESHOLD, STOP_LOSS_PANIC_THRESHOLD, MIN_HOLD_DAYS,
@@ -52,10 +53,14 @@ BT_ROTATION_BUFFER = os.environ.get("BT_ROTATION_BUFFER", "1") != "0"
 # 动量持续性过滤 (2026-11-17, 与实盘 strategy/intraday_signal 同步)
 #   默认跟随 config 开启; 设 BT_MOMENTUM_PERSIST=0 可关掉做 A/B 对比。
 #   另可用环境变量扫参数: BT_PERSIST_MODE / BT_PERSIST_LOOKBACK / BT_PERSIST_MIN_DELTA
+#   BT_PERSIST_REQUIRE_POSITIVE=0 可关掉 11-18「窗口内全为正」硬约束做 A/B
 BT_MOMENTUM_PERSIST = os.environ.get("BT_MOMENTUM_PERSIST", "1") != "0"
 BT_PERSIST_MODE = os.environ.get("BT_PERSIST_MODE", MOMENTUM_PERSIST_MODE)
 BT_PERSIST_LOOKBACK = int(os.environ.get("BT_PERSIST_LOOKBACK", MOMENTUM_PERSIST_LOOKBACK))
 BT_PERSIST_MIN_DELTA = float(os.environ.get("BT_PERSIST_MIN_DELTA", MOMENTUM_PERSIST_MIN_DELTA))
+BT_PERSIST_REQUIRE_POSITIVE = os.environ.get(
+    "BT_PERSIST_REQUIRE_POSITIVE",
+    "1" if MOMENTUM_PERSIST_REQUIRE_POSITIVE else "0") != "0"
 
 from momentum_persistence import check_persistence
 
@@ -189,6 +194,7 @@ def calc_momentum_bt(ts_code, current_date, prices):
         mode=BT_PERSIST_MODE,
         lookback=BT_PERSIST_LOOKBACK,
         min_delta=BT_PERSIST_MIN_DELTA,
+        require_positive=BT_PERSIST_REQUIRE_POSITIVE,
     )
     return {"momentum_20d": m20, "momentum_60d": m60,
             "composite": composite, "persist_ok": persist_ok}
@@ -690,9 +696,11 @@ class BacktestEngine:
         report_lines.append(f"  止盈: 移动止盈(激活+{TRAILING_STOP_ACTIVATE:.0f}%, 回撤{TRAILING_STOP_PULLBACK:.0f}%, Top1容限{TRAILING_STOP_TOP1_PULLBACK:.0f}%)  止损: {STOP_LOSS_THRESHOLD:.0f}%")
         report_lines.append(f"  PE择时: <{PE_BUY_THRESHOLD}%买入, >{PE_SELL_THRESHOLD}%卖出 (5年百分位)")
         report_lines.append(f"  动量门槛: 综合得分>{MOMENTUM_MIN_THRESHOLD}%才纳入轮动")
-        report_lines.append(
-            f"  持续性过滤: {'启用 ' + BT_PERSIST_MODE + '/回看' + str(BT_PERSIST_LOOKBACK) + '日'
-                            if BT_MOMENTUM_PERSIST else '关闭(A/B对照)'}")
+        persist_desc = "关闭(A/B对照)"
+        if BT_MOMENTUM_PERSIST:
+            persist_desc = (f"启用 {BT_PERSIST_MODE}/回看{BT_PERSIST_LOOKBACK}日/"
+                            f"{'窗口内全为正' if BT_PERSIST_REQUIRE_POSITIVE else '仅端点比较'}")
+        report_lines.append(f"  持续性过滤: {persist_desc}")
         if BT_MA20_RULES:
             report_lines.append(
                 f"  MA20防守: 买入闸门=收盘>MA20; 趋势止损=收盘<MA20×{MA20_STOP_LOSS_RATIO} (持有>={MIN_HOLD_DAYS}天)"

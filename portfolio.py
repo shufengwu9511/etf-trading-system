@@ -8,6 +8,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from db import get_connection
 from redeem_fee import calc_redeem_fee
+from signal_exec import link_trade_to_signal
 from config import (
     TOTAL_CAPITAL, CORE_RATIO, SATELLITE_RATIO,
     SINGLE_ETF_MAX_RATIO, MIN_TRADE_AMOUNT,
@@ -561,7 +562,7 @@ def sell_holding(fund_code, submit_date=None, confirm_date=None, fee=None):
     """, (h["id"],))
 
     # 记录交易
-    conn.execute("""
+    cur = conn.execute("""
         INSERT INTO trades (fund_code, etf_code, name, trade_type, amount, shares, nav, fee,
                            status, submit_date, confirm_date, settle_date, signal_source, remark)
         VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, 'done', ?, ?, ?, 'manual', ?)
@@ -569,6 +570,10 @@ def sell_holding(fund_code, submit_date=None, confirm_date=None, fee=None):
           net_amount, h["shares"], h["current_nav"], float(fee_info["fee"]),
           h["buy_date"] or confirm_date, confirm_date, None,
           f"{fee_tag}手动赎回: 成本¥{h['total_cost']:,.0f}, 毛额¥{sell_amount:,.2f}, 盈亏{h['profit_pct']:+.2f}%"))
+
+    # 执行闭环: 同一事务内把对应信号标记为已执行
+    link_trade_to_signal(conn, cur.lastrowid, "sell", h["fund_code"], h["etf_code"],
+                         submit_date)
 
     conn.commit()
     conn.close()
@@ -654,6 +659,10 @@ def update_holding(fund_code, new_shares=None, new_cost_nav=None, add_shares=Non
               round(add_amount, 2), add_shares, round(add_amount / add_shares, 4) if add_shares else old_cost_nav,
               _submit, _confirm, None,
               f"手动加仓: +{add_shares}份, 加仓¥{add_amount:,.0f}, 申购{_submit}, 确认{_confirm}"))
+
+        # 执行闭环: 加仓也是一次买入, 同一事务内认领对应信号
+        link_trade_to_signal(conn, conn.execute("SELECT last_insert_rowid()").fetchone()[0],
+                             "buy", h["fund_code"], h["etf_code"], _submit)
 
         conn.commit()
         conn.close()
@@ -1030,20 +1039,38 @@ def save_signals_to_db(signals_result, panic_alert):
     conn = get_connection()
     today = datetime.now().strftime("%Y%m%d")
 
-    # 先清除当天旧信号, 避免重复运行导致数据重复
-    conn.execute("DELETE FROM signals WHERE signal_date = ?", (today,))
+    # 只清除当天「尚未执行」的旧信号 (避免重复运行导致数据重复)。
+    # 已执行的信号必须保留 —— 当天重跑主流程时若把它删掉, 交易与信号的
+    # 关联(is_executed / executed_trade_id)会一起丢失, 执行闭环就断了。
+    conn.execute("DELETE FROM signals WHERE signal_date = ? AND is_executed = 0", (today,))
+
+    # 已执行信号的指纹, 用于阻止重跑时把同一条指令再生成一遍。
+    # 否则会出现「一条已执行 + 一条待执行」的重复指令, 看板上像没做过。
+    executed_keys = {
+        (r["signal_type"], r["etf_code"], r["direction"])
+        for r in conn.execute("""
+            SELECT signal_type, etf_code, direction FROM signals
+            WHERE signal_date = ? AND is_executed = 1
+        """, (today,))
+    }
+
+    def _emit(sig_type, sig, priority="normal"):
+        key = (sig_type, sig["etf_code"], sig.get("direction", ""))
+        if key in executed_keys:
+            return
+        _insert_signal(conn, today, sig_type, sig, priority=priority)
 
     for sig in signals_result.get("core", []):
-        _insert_signal(conn, today, "core_pe", sig)
+        _emit("core_pe", sig)
 
     for sig in signals_result.get("rotation", {}).get("buy", []):
-        _insert_signal(conn, today, "rotation_buy", sig)
+        _emit("rotation_buy", sig)
     for sig in signals_result.get("rotation", {}).get("sell", []):
-        _insert_signal(conn, today, "rotation_sell", sig)
+        _emit("rotation_sell", sig)
 
     for sig in signals_result.get("stop", []):
         priority = sig.get("priority", "high")
-        _insert_signal(conn, today, sig.get("signal_type", "stop"), sig, priority=priority)
+        _emit(sig.get("signal_type", "stop"), sig, priority=priority)
 
     conn.commit()
     conn.close()
@@ -1119,12 +1146,15 @@ def buy_new_holding(fund_code, amount, etf_code=None, name=None, category="satel
     """, (fund_code, etf_code, name, category, amount, amount, buy_date, confirm_date, amount))
 
     # 记录交易
-    conn.execute("""
+    cur = conn.execute("""
         INSERT INTO trades (fund_code, etf_code, name, trade_type, amount, shares, nav, fee,
                            status, submit_date, confirm_date, settle_date, signal_source, remark)
         VALUES (?, ?, ?, 'buy', ?, 0, 0, 0, 'pending', ?, ?, ?, 'manual', ?)
     """, (fund_code, etf_code, name, round(amount, 2), buy_date, confirm_date or buy_date, None,
           f"新建申购: ¥{amount:,.0f}, 待确认份额"))
+
+    # 执行闭环: 同一事务内把对应买入信号标记为已执行
+    link_trade_to_signal(conn, cur.lastrowid, "buy", fund_code, etf_code, buy_date)
 
     conn.commit()
     conn.close()
@@ -1283,7 +1313,7 @@ def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, c
             WHERE id = ?
         """, (h["id"],))
 
-        conn.execute("""
+        cur = conn.execute("""
             INSERT INTO trades (fund_code, etf_code, name, trade_type, amount, shares, nav, fee,
                                status, submit_date, confirm_date, settle_date, signal_source, remark)
             VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, 'done', ?, ?, ?, 'manual', ?)
@@ -1291,6 +1321,10 @@ def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, c
               round(sell_amount, 2), h["shares"], h["current_nav"], float(fee_info["fee"]),
               submit_date, confirm_date, None,
               f"{fee_tag}手动赎回: 成本¥{h['total_cost']:,.0f}, 毛额¥{gross_amount:,.2f}, 盈亏{h['profit_pct']:+.2f}%"))
+
+        # 执行闭环: 同一事务内认领对应卖出信号
+        link_trade_to_signal(conn, cur.lastrowid, "sell", h["fund_code"], h["etf_code"],
+                             submit_date)
 
         emoji = "🟢" if h["profit_pct"] >= 0 else "🔴"
         print(f"  {emoji} {h['name']} ({fund_code}) 已全部赎回")
@@ -1315,7 +1349,7 @@ def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, c
               round(new_market_value, 2), round(new_profit_loss, 2), round(new_profit_pct, 2),
               h["id"]))
 
-        conn.execute("""
+        cur = conn.execute("""
             INSERT INTO trades (fund_code, etf_code, name, trade_type, amount, shares, nav, fee,
                                status, submit_date, confirm_date, settle_date, signal_source, remark)
             VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, 'done', ?, ?, ?, 'manual', ?)
@@ -1323,6 +1357,10 @@ def sell_holding_partial(fund_code, ratio=None, shares=None, submit_date=None, c
               round(sell_amount, 2), sell_shares, h["current_nav"], float(fee_info["fee"]),
               submit_date, confirm_date, None,
               f"{fee_tag}部分赎回({actual_ratio:.1%}): {sell_shares:.2f}份, 毛额¥{gross_amount:,.2f}, 盈亏¥{sell_profit:+,.2f}"))
+
+        # 执行闭环: 部分减仓同样认领信号 (宽基 reduce 属此路径)
+        link_trade_to_signal(conn, cur.lastrowid, "sell", h["fund_code"], h["etf_code"],
+                             submit_date)
 
         emoji = "🟢" if sell_profit >= 0 else "🔴"
         print(f"  {emoji} {h['name']} ({fund_code}) 部分赎回完成")

@@ -12,12 +12,31 @@ def get_db_path():
     return os.path.join(DATA_DIR, DB_NAME)
 
 
+# 进程内只做一次的轻量迁移标记 (避免每次 get_connection 都跑 PRAGMA)
+_SCHEMA_MIGRATED = False
+
+
 def get_connection():
     """获取数据库连接"""
+    global _SCHEMA_MIGRATED
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+
+    # 旧库兼容: CREATE TABLE IF NOT EXISTS 不会给已存在的表补列。
+    # 日常 buy/sell 不走 init_db(), 所以必须在连接层保证执行闭环字段可用。
+    if not _SCHEMA_MIGRATED:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(signals)")}
+        for col, ddl in (("is_executed", "INTEGER DEFAULT 0"),
+                         ("executed_at", "TEXT"),
+                         ("executed_trade_id", "INTEGER")):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {ddl}")
+        if "is_executed" not in cols:
+            conn.execute("UPDATE signals SET is_executed = 0 WHERE is_executed IS NULL")
+        conn.commit()
+        _SCHEMA_MIGRATED = True
     return conn
 
 
@@ -153,9 +172,12 @@ def init_db():
             priority TEXT DEFAULT 'normal',
             is_executed INTEGER DEFAULT 0,
             executed_at TEXT,
+            executed_trade_id INTEGER,
             created_at TEXT DEFAULT (datetime('now', 'localtime'))
         )
     """)
+
+    # 旧库补列统一由 get_connection() 的幂等迁移负责 (init_db 也走该函数)
 
     # ---- 动量得分表 ----
     cursor.execute("""

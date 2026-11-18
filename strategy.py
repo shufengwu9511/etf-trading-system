@@ -14,6 +14,7 @@ from config import (
     MOMENTUM_MIN_THRESHOLD,
     MOMENTUM_PERSIST_ENABLED, MOMENTUM_PERSIST_MODE,
     MOMENTUM_PERSIST_LOOKBACK, MOMENTUM_PERSIST_MIN_DELTA,
+    MOMENTUM_PERSIST_REQUIRE_POSITIVE,
     ROTATION_HOLD_COUNT, ROTATION_CYCLE_DAYS,
     ROTATION_RANK_BUFFER, ROTATION_MAX_HOLD_COUNT,
     # 移动止盈 + 止损
@@ -757,6 +758,7 @@ def check_unexecuted_signals(holdings=None, lookback_days=None, grace_days=None)
            FROM signals
            WHERE direction = 'sell' AND signal_date >= ? AND fund_code IS NOT NULL
              AND signal_type IN ('trend_stop', 'stop_loss', 'trailing_stop')
+             AND is_executed = 0
            GROUP BY fund_code""",
         (window_start,)).fetchall()
 
@@ -782,6 +784,7 @@ def check_unexecuted_signals(holdings=None, lookback_days=None, grace_days=None)
             """SELECT DISTINCT signal_date FROM signals
                WHERE fund_code = ? AND direction = 'sell'
                  AND signal_type IN ('trend_stop', 'stop_loss', 'trailing_stop')
+                 AND is_executed = 0
                ORDER BY signal_date""", (fc,)).fetchall()]
         if not sig_dates:
             continue
@@ -1041,6 +1044,7 @@ def _calc_single_momentum(ts_code, conn):
         mode=MOMENTUM_PERSIST_MODE,
         lookback=MOMENTUM_PERSIST_LOOKBACK,
         min_delta=MOMENTUM_PERSIST_MIN_DELTA,
+        require_positive=MOMENTUM_PERSIST_REQUIRE_POSITIVE,
     )
 
     return {

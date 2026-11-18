@@ -1,4 +1,4 @@
-"""动量持续性过滤 (2026-11-17 新增)
+"""动量持续性过滤 (2026-11-17 新增, 2026-11-18 完善)
 
 背景: 原买入三重闸门 = 「动量Top3 + 综合动量>0 + 收盘>MA20」, 全部只看**当日快照**,
 本质是追过去 10/30 日涨幅。实测机器人 020972 在 2026-11-04~11-13 期间综合动量
@@ -6,6 +6,11 @@
 11-10 在反弹尖峰 +7.43/#1 发出买入信号, 买入后 6 天转为 -0.60 并浮亏 -7.61%。
 故加一层「动量是否持续」的校验, 只约束**新买入**, 不改变已持仓的卖出判定
 (与 MA20 闸门同原则: 只做买入侧独立闸门, 不提前过滤 TopN, 避免误伤持仓)。
+
+2026-11-18 完善: 原 improve 只比较窗口两端, 会**跳过中间深坑**。实证半导体 021893
+综合动量 11-13 +0.49% → 11-16 -6.81% → 11-17 +1.52%, 回看2日只比 11-17 与 11-13,
+V型反弹被判「持续走强」, 主流程据此给出 ¥240,000 申购信号(盘中口径同期却是 -3.54%)。
+故新增硬约束 require_positive: 窗口内**每一个交易日**的综合动量都必须 >0。
 
 三处共用本模块, 口径必须一致:
   - strategy.py          收盘 K 线 (index_daily)
@@ -44,7 +49,8 @@ def composite_at(closes, end_idx):
         return None
 
 
-def check_persistence(closes, enabled=True, mode="improve", lookback=3, min_delta=0.0):
+def check_persistence(closes, enabled=True, mode="improve", lookback=3, min_delta=0.0,
+                      require_positive=True):
     """判断动量是否具备持续性。
 
     closes   : 升序收盘价序列, 最后一个元素 = 当日收盘 (盘中口径为「现价代理收盘」)
@@ -56,11 +62,17 @@ def check_persistence(closes, enabled=True, mode="improve", lookback=3, min_delt
                         拦住单日跳变刚转正的标的
     lookback : 回看交易日数
     min_delta: improve 模式要求的最小改善幅度 (百分点)
+    require_positive : (2026-11-18) 硬约束 — 窗口 [当日-lookback, 当日] 内
+                       每一个交易日的综合动量都必须 > MOMENTUM_MIN_THRESHOLD。
+                       与 mode 叠加生效, 堵住 improve「只比端点跳过中间深坑」的漏洞。
+                       设 False 可退回 11-17 旧口径做 A/B。
 
     返回 (ok: bool, info: dict)。历史数据不足时不拦截 (避免开局无信号)。
     """
     info = {"enabled": bool(enabled), "mode": mode, "lookback": lookback,
-            "today": None, "past": None, "ok": True, "reason": ""}
+            "require_positive": bool(require_positive),
+            "today": None, "past": None, "window": None,
+            "ok": True, "reason": ""}
     if not enabled or mode == "off" or not closes:
         info["reason"] = "未启用"
         return True, info
@@ -71,6 +83,20 @@ def check_persistence(closes, enabled=True, mode="improve", lookback=3, min_delt
     if today is None:
         info["reason"] = "历史数据不足, 不拦截"
         return True, info
+
+    # 2026-11-18 硬约束: 窗口内每日动量必须为正 (拦 V 型反弹 / 两负也判「走强」)
+    if require_positive:
+        window_vals = [composite_at(closes, i) for i in range(n - lookback, n + 1)]
+        info["window"] = [round(v, 4) if v is not None else None for v in window_vals]
+        bad = [v for v in window_vals if v is not None and v <= MOMENTUM_MIN_THRESHOLD]
+        if bad:
+            info["ok"] = False
+            window_txt = ", ".join(f"{v:+.2f}%" if v is not None else "N/A"
+                                   for v in window_vals)
+            info["reason"] = (f"回看{lookback}日窗口 [{window_txt}] 内有"
+                              f"{len(bad)}日动量≤{MOMENTUM_MIN_THRESHOLD:.0f}% "
+                              f"(最低{min(bad):+.2f}%), 不满足全窗口为正")
+            return False, info
 
     if mode == "consecutive":
         vals = [composite_at(closes, i) for i in range(n - lookback + 1, n + 1)]

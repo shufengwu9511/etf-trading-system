@@ -481,12 +481,37 @@ def _legacy_get_realtime_quotes_akshare():
         }
 
 
+def _exec_badge(sig):
+    """信号执行闭环标记 (2026-11-18): 已执行指令在看板打勾, 避免重复下单。
+    数据来自 buy/sell 写入 trades 时同一事务内的 is_executed/executed_trade_id 回写。
+    """
+    if not sig.get("is_executed"):
+        return ""
+    at = (sig.get("executed_at") or "")[:16]
+    tid = sig.get("executed_trade_id")
+    tip = f"已执行 {at}" + (f" · trade#{tid}" if tid else "")
+    return (f'<span title="{tip}" style="display:inline-block;margin-right:6px;'
+            f'padding:1px 6px;border-radius:4px;background:#dcfce7;'
+            f'color:#166534;font-size:11px">✅ 已执行</span>')
+
+
 def _render_action(action, panic):
     """渲染结构化的今日交易指令"""
     if not action.get("has_signals"):
         return '<div style="padding:20px;text-align:center;color:#9ca3af">今日无交易指令</div>'
 
     parts = []
+
+    # 执行闭环汇总: 今日已按信号下单的条数 (2026-11-18)
+    all_sigs = (action.get("stop", []) + action.get("core", [])
+                + action.get("rotation_buy", []) + action.get("rotation_sell", []))
+    done = [s for s in all_sigs if s.get("is_executed")]
+    if done:
+        parts.append(f'''
+        <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;
+                    padding:8px 14px;margin-bottom:16px;font-size:12px;color:#166534">
+            ✅ 今日已执行 {len(done)} 条指令 (交易写入时已自动关联信号) —— 下方打勾项无需重复下单
+        </div>''')
 
     # 恐慌预警
     if panic and panic.get("alert_level") == "PANIC":
@@ -512,7 +537,7 @@ def _render_action(action, panic):
             amount = sig.get("amount", 0) or sig.get("target_amount", 0)
             stop_rows += f'''
             <tr>
-                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">{icon} {sig.get("name","")}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">{_exec_badge(sig)}{icon} {sig.get("name","")}</td>
                 <td style="padding:8px 12px;color:#6b7280">{sig.get("fund_code","")}</td>
                 <td style="padding:8px 12px">{_fmt_money(amount)}</td>
                 <td style="padding:8px 12px;font-size:12px">{sig.get("reason","")}</td>
@@ -535,7 +560,7 @@ def _render_action(action, panic):
             amount = sig.get("amount", 0) or sig.get("target_amount", 0)
             core_rows += f'''
             <tr>
-                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">{dir_icon} {sig.get("name","")}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">{_exec_badge(sig)}{dir_icon} {sig.get("name","")}</td>
                 <td style="padding:8px 12px;color:#6b7280">{sig.get("fund_code","")}</td>
                 <td style="padding:8px 12px">{_fmt_money(amount)}</td>
                 <td style="padding:8px 12px;font-size:12px">{sig.get("reason","")}</td>
@@ -560,7 +585,7 @@ def _render_action(action, panic):
             buy_rows += f'''
             <tr>
                 <td style="padding:8px 12px;color:#6b7280;font-size:12px">{sig.get("signal_date","")}</td>
-                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">🟢 {sig.get("name","")}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">{_exec_badge(sig)}🟢 {sig.get("name","")}</td>
                 <td style="padding:8px 12px;color:#6b7280">{sig.get("fund_code","")}</td>
                 <td style="padding:8px 12px">{_fmt_money(amount)}</td>
                 <td style="padding:8px 12px;font-size:12px">{sig.get("reason","")}</td>
@@ -572,7 +597,7 @@ def _render_action(action, panic):
             sell_rows += f'''
             <tr>
                 <td style="padding:8px 12px;color:#6b7280;font-size:12px">{sig.get("signal_date","")}</td>
-                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">🔴 {sig.get("name","")}</td>
+                <td style="padding:8px 12px;font-weight:500;cursor:pointer" class="fund-name" data-fund-code="{sig.get('etf_code','')}">{_exec_badge(sig)}🔴 {sig.get("name","")}</td>
                 <td style="padding:8px 12px;color:#6b7280">{sig.get("fund_code","")}</td>
                 <td style="padding:8px 12px">{_fmt_money(amount)}</td>
                 <td style="padding:8px 12px;font-size:12px">{sig.get("reason","")}</td>
@@ -581,7 +606,7 @@ def _render_action(action, panic):
         <div style="margin-bottom:16px">
             <h4 style="font-size:15px;color:#374151;margin-bottom:8px">🔄 行业ETF动量轮动</h4>
             <div style="font-size:12px;color:#6b7280;margin-bottom:8px">
-                <span style="font-weight:600;color:#1e40af">买入闸门(三重全满足):</span> ① 动量Top3 ② 复合动量&gt;0 ③ 收盘价在MA20上方 &nbsp;|&nbsp;
+                <span style="font-weight:600;color:#1e40af">买入闸门(四重全满足):</span> ① 动量Top3 ② 复合动量&gt;0 ③ 收盘价在MA20上方 ④ 动量持续性(回看2日窗口内每日动量均&gt;0 且当日≥2日前; 只约束新买入) &nbsp;|&nbsp;
                 <span style="font-weight:600;color:#991b1b">卖出防线(任一触发):</span> ① 移动止盈(8%激活/6%回撤) ② MA20×0.95趋势止损 ③ 固定止损(-15%) ④ 跌出Top5缓冲区 或 动量转负/跌破MA20(持有满7天即可卖) &nbsp;|&nbsp; <span style="font-weight:600;color:#1e40af">持仓:</span> 基础Top3, 全部持仓仍向上时可超额至5只
             </div>
             {'<table style="width:100%;margin-bottom:8px"><thead><tr><th>信号日期</th><th>标的</th><th>基金代码</th><th>金额</th><th>原因</th></tr></thead><tbody>' + buy_rows + '</tbody></table>' if rot_buy else ''}
@@ -769,7 +794,7 @@ def _render_intraday(intraday):
             </table>
         </div>
         <div style="margin-top:8px;font-size:11px;color:#9ca3af">
-            ⭐=买入闸门通过(Top3) · 🔒=7天锁内暂不赎回 · Top5缓冲区内且动量/趋势仍向上则继续持有 · 本信号仅作参考, 临界信号建议次日确认; 实际申赎请在持仓系统(main.py)中维护
+            ⭐=动量Top3(不含持续性判定) · ④持续性=回看2日窗口内每日综合动量均&gt;0 · 🔒=7天锁内暂不赎回 · Top5缓冲区内且动量/趋势仍向上则继续持有 · 本信号仅作参考, 临界信号建议次日确认; 实际申赎请在持仓系统(main.py)中维护
         </div>
     </div>
 </div>'''

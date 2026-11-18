@@ -549,6 +549,36 @@ def run_import(csv_path):
     print("\n✅ 持仓导入完成! 运行 python main.py 即可查看基于当前持仓的信号")
 
 
+def run_link_signals(args):
+    """
+    历史信号执行关联: python main.py link-signals [--apply]
+
+    默认 dry-run 只预览。历史交易里绝大多数是脱离信号手动下单的, 硬凑关联
+    反而污染数据, 所以必须由人看过清单后再决定是否 --apply。
+    """
+    apply = "--apply" in args
+    print("=" * 70)
+    print(f"  历史信号执行关联  ({'落库回填' if apply else '仅预览 / dry-run'})")
+    print("=" * 70)
+    from db import get_connection
+    from signal_exec import backfill_execution_links
+
+    conn = get_connection()
+    linked, skipped = backfill_execution_links(conn, dry_run=not apply, verbose=False)
+    if apply:
+        conn.commit()
+    conn.close()
+
+    print(f"\n  可关联 {len(linked)} 笔交易 / 无对应信号 {len(skipped)} 笔 (记为手动交易)\n")
+    for tid, date, ttype, fc, sid, sdate in linked:
+        print(f"    trade#{tid:<4} {date} {ttype:<4} {fc:<8} → signal#{sid:<5} ({sdate})")
+    if not apply:
+        print("\n  ⚠️ 以上仅为预览, 数据库未修改。确认无误后执行:")
+        print("     python main.py link-signals --apply")
+    else:
+        print(f"\n  ✅ 已回填 {len(linked)} 条关联 (signals.is_executed / trades.signal_source)")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
@@ -579,6 +609,8 @@ if __name__ == "__main__":
             run_etf_pool()
         elif cmd == "dashboard":
             run_dashboard()
+        elif cmd == "link-signals":
+            run_link_signals(sys.argv[2:])
         else:
             print(f"未知命令: {sys.argv[1]}")
             print("可用命令:")
@@ -598,5 +630,7 @@ if __name__ == "__main__":
             print("  python main.py add-etf --fund-code X --name X     添加自定义ETF到候选池")
             print("  python main.py pool         列出候选池ETF")
             print("  python main.py dashboard    生成可视化看板")
+            print("  python main.py link-signals 历史信号执行关联 (默认仅预览, 不落库)")
+            print("                              --apply 才真正回填; 用于补录旧数据")
     else:
         run_daily()
